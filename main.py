@@ -340,104 +340,98 @@ def generate_roster(req: RosterRequest):
                 if start_min <= t < end_min:
                     assigned[t] += 1
 
-            # stop if all covered
+             # stop if all covered
             if all(assigned[t] >= demand[t] for t in times):
                 break
 
-  # ... your existing greedy assignment code finishes here and you have `roster`, `times`, `demand`, `assigned` ready
+    # === Break planning (15/30/15) ===
+    try:
+        time_list = sorted(times)
 
-# === Break planning (15/30/15) ===
-try:
-    time_list = sorted(times)
-    def snap_to_grid(m):
-        return min(time_list, key=lambda t: abs(t - m)) if time_list else m
+        def snap_to_grid(m):
+            return min(time_list, key=lambda t: abs(t - m)) if time_list else m
 
-    def clamp(v, lo, hi):
-        return max(lo, min(hi, v))
+        for item in roster:
+            st_str, en_str = [s.strip() for s in item["shift"].split("-")]
+            st_h, st_m = map(int, st_str.split(":"))
+            en_h, en_m = map(int, en_str.split(":"))
+            start_min = st_h * 60 + st_m
+            end_min = en_h * 60 + en_m
+            if end_min <= start_min:
+                end_min += 24 * 60
 
-    def pick_best_slot(candidate_starts, duration_min, demand_curve, assigned_curve):
-        best = None
-        best_score = None
-        for s in candidate_starts:
-            e = s + duration_min
-            score = 0
-            for t in demand_curve:
-                if s <= t < e:
-                    score += max(demand_curve[t] - assigned_curve[t], 0)
-            if best_score is None or score < best_score:
-                best_score = score
-                best = s
-        return best
+            NO_HEAD, NO_TAIL, GAP = 60, 60, 120
+            place_start = start_min + NO_HEAD
+            place_end = end_min - NO_TAIL
+            if place_end - place_start < (15 + 30 + 15 + 2 * GAP):
+                item["breaks"] = []
+                continue
 
-    for item in roster:
-        st_str, en_str = [s.strip() for s in item["shift"].split("-")]
-        st_h, st_m = map(int, st_str.split(":"))
-        en_h, en_m = map(int, en_str.split(":"))
-        start_min = st_h*60 + st_m
-        end_min = en_h*60 + en_m
-        if end_min <= start_min:
-            end_min += 24*60
+            mid = (start_min + end_min) // 2
+            lunch_target = clamp(mid, place_start + GAP // 2, place_end - GAP // 2)
+            b1_target = clamp(lunch_target - GAP - 45, place_start, place_end)
+            b3_target = clamp(lunch_target + GAP + 45, place_start, place_end)
 
-        NO_HEAD, NO_TAIL, GAP = 60, 60, 120
-        place_start = start_min + NO_HEAD
-        place_end   = end_min   - NO_TAIL
-        if place_end - place_start < (15+30+15 + 2*GAP):
+            def window(center, dur):
+                w_lo = clamp(center - 60, place_start, place_end - dur)
+                w_hi = clamp(center + 60, place_start, place_end - dur)
+                candidates = [t for t in time_list if w_lo <= t <= w_hi]
+                return candidates or [snap_to_grid(center)]
+
+            lunch_c = window(lunch_target, 30)
+            lunch_s = pick_best_slot(lunch_c, 30, demand, assigned) or snap_to_grid(lunch_target)
+            lunch_e = lunch_s + 30
+
+            b1_end_allowed = lunch_s - GAP
+            b1_c = [t for t in window(b1_target, 15) if (t + 15) <= b1_end_allowed]
+            if not b1_c:
+                b1_c = [t for t in time_list if place_start <= t <= max(place_start, lunch_s - GAP - 15)]
+            b1_s = pick_best_slot(b1_c, 15, demand, assigned) if b1_c else None
+            if b1_s is None and place_start + 15 <= b1_end_allowed:
+                b1_s = snap_to_grid(max(place_start, min(b1_target, b1_end_allowed - 15)))
+            b1_e = b1_s + 15 if b1_s is not None else None
+
+            b3_start_allowed = lunch_e + GAP
+            b3_c = [t for t in window(b3_target, 15) if t >= b3_start_allowed]
+            if not b3_c:
+                b3_c = [t for t in time_list if min(place_end - 15, b3_target) <= t <= (place_end - 15)]
+            b3_s = pick_best_slot(b3_c, 15, demand, assigned) if b3_c else None
+            if b3_s is None and b3_start_allowed <= (place_end - 15):
+                b3_s = snap_to_grid(min(place_end - 15, max(b3_target, b3_start_allowed)))
+            b3_e = b3_s + 15 if b3_s is not None else None
+
             item["breaks"] = []
-            continue
+            if b1_s is not None:
+                item["breaks"].append({
+                    "start": minutes_to_hhmm(b1_s % (24 * 60)),
+                    "end": minutes_to_hhmm(b1_e % (24 * 60)),
+                    "kind": "break15"
+                })
+            item["breaks"].append({
+                "start": minutes_to_hhmm(lunch_s % (24 * 60)),
+                "end": minutes_to_hhmm(lunch_e % (24 * 60)),
+                "kind": "lunch30"
+            })
+            if b3_s is not None:
+                item["breaks"].append({
+                    "start": minutes_to_hhmm(b3_s % (24 * 60)),
+                    "end": minutes_to_hhmm(b3_e % (24 * 60)),
+                    "kind": "break15"
+                })
+    except Exception as e:
+        print("[break planning] skipped due to error:", e)
+        for item in roster:
+            item.setdefault("breaks", [])
 
-        mid = (start_min + end_min)//2
-        lunch_target = clamp(mid, place_start+GAP//2, place_end-GAP//2)
-        b1_target = clamp(lunch_target - GAP - 45, place_start, place_end)
-        b3_target = clamp(lunch_target + GAP + 45, place_start, place_end)
-
-        def window(center, dur):
-            w_lo = clamp(center - 60, place_start, place_end - dur)
-            w_hi = clamp(center + 60, place_start, place_end - dur)
-            c = [t for t in time_list if w_lo <= t <= w_hi]
-            return c or [snap_to_grid(center)]
-
-        lunch_c = window(lunch_target, 30)
-        lunch_s = pick_best_slot(lunch_c, 30, demand, assigned) or snap_to_grid(lunch_target)
-        lunch_e = lunch_s + 30
-
-        b1_end_allowed = lunch_s - GAP
-        b1_c = [t for t in window(b1_target, 15) if (t+15) <= b1_end_allowed]
-        if not b1_c:
-            b1_c = [t for t in time_list if place_start <= t <= max(place_start, lunch_s - GAP - 15)]
-        b1_s = pick_best_slot(b1_c, 15, demand, assigned) if b1_c else None
-        if b1_s is None and place_start + 15 <= b1_end_allowed:
-            b1_s = snap_to_grid(max(place_start, min(b1_target, b1_end_allowed - 15)))
-        b1_e = b1_s + 15 if b1_s is not None else None
-
-        b3_start_allowed = lunch_e + GAP
-        b3_c = [t for t in window(b3_target, 15) if t >= b3_start_allowed]
-        if not b3_c:
-            b3_c = [t for t in time_list if min(place_end-15, b3_target) <= t <= (place_end-15)]
-        b3_s = pick_best_slot(b3_c, 15, demand, assigned) if b3_c else None
-        if b3_s is None and b3_start_allowed <= (place_end-15):
-            b3_s = snap_to_grid(min(place_end-15, max(b3_target, b3_start_allowed)))
-        b3_e = b3_s + 15 if b3_s is not None else None
-
-        item["breaks"] = []
-        if b1_s is not None:
-            item["breaks"].append({"start": minutes_to_hhmm(b1_s % (24*60)),
-                                   "end": minutes_to_hhmm(b1_e % (24*60)), "kind": "break15"})
-        item["breaks"].append({"start": minutes_to_hhmm(lunch_s % (24*60)),
-                               "end": minutes_to_hhmm(lunch_e % (24*60)), "kind": "lunch30"})
-        if b3_s is not None:
-            item["breaks"].append({"start": minutes_to_hhmm(b3_s % (24*60)),
-                                   "end": minutes_to_hhmm(b3_e % (24*60)), "kind": "break15"})
-except Exception as e:
-    print("[break planning] skipped due to error:", e)
-    for item in roster:
-        item.setdefault("breaks", [])
-
-# NOW build summary (after breaks are attached)
-summary = {
-    "date": req.date,
-    "intervals": [{"time": minutes_to_hhmm(t), "req": demand[t], "assigned": assigned[t]} for t in times],
-    "agents_used": len(used),
-    "roster": roster,
-    "notes": ["MVP stub: same-day 9h greedy coverage with 15/30/15 breaks. Next: subtract breaks from capacity, fairness, rest rules."]
-}
-return summary
+    # Build summary after breaks are set
+    summary = {
+        "date": req.date,
+        "intervals": [{"time": minutes_to_hhmm(t), "req": demand[t], "assigned": assigned[t]} for t in times],
+        "agents_used": len(used),
+        "roster": roster,
+        "notes": [
+            "MVP stub: same-day 9h greedy coverage with 15/30/15 breaks. "
+            "Next: subtract breaks from capacity, fairness, rest rules."
+        ],
+    }
+    return summary
