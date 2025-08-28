@@ -173,3 +173,162 @@ def requirements(
             "req_after_shrinkage": req,
         })
     return out
+
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+
+class RosterRequest(BaseModel):
+    date: str                    # YYYY-MM-DD
+    language: Optional[str] = None
+    grp: Optional[str] = None
+    shrinkage: float = 0.30
+    interval_seconds: int = 1800
+    target_sl: float = 0.80
+    target_t: int = 20
+
+def time_to_minutes(tstr: str) -> int:
+    hh, mm, ss = tstr.split(":")
+    return int(hh) * 60 + int(mm)  # ignore seconds
+
+def minutes_to_hhmm(m: int) -> str:
+    hh = (m // 60) % 24
+    mm = m % 60
+    return f"{hh:02d}:{mm:02d}"
+
+@app.post("/generate-roster")
+def generate_roster(req: RosterRequest):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+
+    # 1) compute requirements for the date (reuse our function/endpoint logic)
+    q = {
+        "date": req.date,
+        "interval_seconds": req.interval_seconds,
+        "target_sl": req.target_sl,
+        "target_t": req.target_t,
+        "shrinkage": req.shrinkage,
+    }
+    if req.language: q["language"] = req.language
+    if req.grp:      q["grp"] = req.grp
+
+    r = httpx.get(f"{REST_BASE}/forecasts", headers=HEADERS, params={
+        "select": "date,interval_time,language,grp,service,volume,aht_sec",
+        "date": f"eq.{req.date}",
+        "order": "interval_time.asc,language.asc,grp.asc",
+        **({ "language": f"eq.{req.language}" } if req.language else {}),
+        **({ "grp": f"eq.{req.grp}" } if req.grp else {}),
+    }, timeout=30)
+    r.raise_for_status()
+    fc_rows = r.json()
+
+    # build per-interval requirement using same math:
+    intervals = []
+    for row in fc_rows:
+        vol = int(row["volume"]); aht = int(row["aht_sec"])
+        N_core = required_agents_for_target(vol, aht, req.interval_seconds, req.target_sl, req.target_t)
+        req_after = ceil(N_core / (1.0 - max(0.0, min(req.shrinkage, 0.95)))) if req.shrinkage < 0.99 else N_core
+        intervals.append({
+            "t": row["interval_time"],
+            "lang": row["language"],
+            "grp": row["grp"],
+            "req": req_after
+        })
+
+    # 2) fetch agents
+    a = httpx.get(f"{REST_BASE}/agents", headers=HEADERS, params={
+        "select": "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services",
+        "limit": 2000
+    }, timeout=30)
+    a.raise_for_status()
+    agents = a.json()
+
+    # basic filter by language/group capability
+    def can_cover(agent, lang, grp):
+        lang_ok = (agent["primary_language"] == lang) or (agent["secondary_language"] == lang)
+        grp_ok = grp in (agent.get("trained_groups") or [])
+        return bool(lang_ok and grp_ok)
+
+    # 3) naive greedy: schedule 9h shift blocks to cover peak first
+    # Build interval minutes list for the day
+    times = sorted({ time_to_minutes(x["t"]) for x in intervals })
+    times_map = { t: [iv for iv in intervals if time_to_minutes(iv["t"])==t] for t in times }
+
+    # demand curve: total required per interval (within filters)
+    demand = { t: sum(iv["req"] for iv in times_map[t]) for t in times }
+    assigned = { t: 0 for t in times }
+
+    # agents pool filtered by capability for language/grp if specified; else all
+    if req.language or req.grp:
+        pool = [ag for ag in agents if all([
+            (not req.language or (ag["primary_language"]==req.language or ag["secondary_language"]==req.language)),
+            (not req.grp or (req.grp in (ag.get("trained_groups") or [])))
+        ])]
+    else:
+        pool = agents[:]
+
+    # simple heuristic: sort intervals by highest unmet demand, assign agents to 9h spans
+    SHIFT_MINUTES = 9 * 60
+    REST_MIN = 12 * 60
+
+    # track last end time to ensure 12h rest (per single day this is trivial; enforced across days later)
+    last_end = {}
+
+    roster = []
+    used = set()
+
+    # helper: check if placing a shift [start, start+9h) helps coverage
+    def shift_gain(start_min):
+        end_min = start_min + SHIFT_MINUTES
+        gain = 0
+        for t in times:
+            if start_min <= t < end_min:
+                need = max(demand[t] - assigned[t], 0)
+                gain += need
+        return gain
+
+    # sort candidate start times on 30-min grid by potential gain (descending)
+    candidate_starts = sorted({t for t in times})
+    candidate_starts.sort(key=lambda s: -shift_gain(s))
+
+    for start in candidate_starts:
+        start_min = start
+        end_min = start_min + SHIFT_MINUTES
+        # while there is unmet demand in this span, assign one more agent
+        while any(start_min <= t < end_min and assigned[t] < demand[t] for t in times):
+            # pick an unused agent that can work (ignore site hours in stub)
+            pick = None
+            for ag in pool:
+                if ag["agent_id"] in used: 
+                    continue
+                # rest rule skip (stub; single day has no prior)
+                pick = ag
+                break
+            if not pick:
+                break
+            # assign this agent
+            used.add(pick["agent_id"])
+            roster.append({
+                "agent_id": pick["agent_id"],
+                "full_name": pick["full_name"],
+                "date": req.date,
+                "shift": f"{minutes_to_hhmm(start_min)} - {minutes_to_hhmm(end_min % (24*60))}",
+                "notes": "stub assignment"
+            })
+            # increment coverage in the span
+            for t in times:
+                if start_min <= t < end_min:
+                    assigned[t] += 1
+
+            # stop if all covered
+            if all(assigned[t] >= demand[t] for t in times):
+                break
+
+    summary = {
+        "date": req.date,
+        "intervals": [{"time": minutes_to_hhmm(t), "req": demand[t], "assigned": assigned[t]} for t in times],
+        "agents_used": len(used),
+        "roster": roster,
+        "notes": ["MVP stub: same-day 9h greedy coverage. We'll add breaks, fairness, sites, rest windows next."]
+    }
+    return summary
+
