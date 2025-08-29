@@ -344,62 +344,156 @@ def generate_roster(req: RosterRequest):
             if all(assigned[t] >= demand[t] for t in times):
                 break
 
-    # === Break planning (15/30/15) ===
+       # === Break planning (15/30/15) with fairness cap & staggering ===
     try:
         time_list = sorted(times)
 
         def snap_to_grid(m):
             return min(time_list, key=lambda t: abs(t - m)) if time_list else m
 
+        # Fairness: cap how many agents can be on break in any interval
+        BREAK_CAP_FRAC = 0.25  # <= 25% of assigned agents per interval on break
+        from math import ceil
+
+        # track current break load per interval (how many already on break)
+        break_load = {t: 0 for t in time_list}
+
+        def cap_at(t):
+            # base on assigned coverage; at least 1 agent may be on break if anyone is working
+            base = assigned[t]
+            if base <= 0:
+                return 0
+            return max(1, int(ceil(base * BREAK_CAP_FRAC)))
+
+        def span_ok(s, dur):
+            """Return True if putting one agent on break [s, s+dur) respects caps in all intervals it touches."""
+            e = s + dur
+            for t in time_list:
+                if s <= t < e:
+                    if break_load[t] + 1 > cap_at(t):
+                        return False
+            return True
+
+        def stress(s, dur):
+            """Lower is better: avoid busy intervals. Doesn’t include cap penalties (handled in choose_slot)."""
+            e = s + dur
+            sc = 0
+            for t in time_list:
+                if s <= t < e:
+                    sc += max(demand[t] - assigned[t], 0)
+            return sc
+
+        def choose_slot(cands, dur):
+            """
+            Pick a start from candidates:
+              pass 1: feasible under cap, minimize stress
+              pass 2: if none feasible, allow smallest total cap violation (then least stress)
+            """
+            best = None
+            best_sc = None
+            # pass 1: feasible
+            for s in cands:
+                if span_ok(s, dur):
+                    sc = stress(s, dur)
+                    if best_sc is None or sc < best_sc:
+                        best_sc = sc
+                        best = s
+            if best is not None:
+                return best
+            # pass 2: minimal violation
+            best = None
+            best_pen = None
+            best_sc = None
+            for s in cands:
+                e = s + dur
+                pen = 0
+                sc = 0
+                for t in time_list:
+                    if s <= t < e:
+                        over = (break_load[t] + 1) - cap_at(t)
+                        if over > 0:
+                            pen += over
+                        sc += max(demand[t] - assigned[t], 0)
+                if (best_pen is None or pen < best_pen
+                        or (pen == best_pen and (best_sc is None or sc < best_sc))):
+                    best_pen = pen
+                    best_sc = sc
+                    best = s
+            return best
+
+        # Helper: candidate grid around a target within ±60m, respecting placeable window
+        def window_candidates(center, duration, lo, hi):
+            w_lo = clamp(center - 60, lo, max(lo, hi - duration))
+            w_hi = clamp(center + 60, lo, max(lo, hi - duration))
+            cands = [t for t in time_list if w_lo <= t <= w_hi]
+            return cands or [snap_to_grid(center)]
+
         for item in roster:
+            # parse shift span
             st_str, en_str = [s.strip() for s in item["shift"].split("-")]
             st_h, st_m = map(int, st_str.split(":"))
             en_h, en_m = map(int, en_str.split(":"))
             start_min = st_h * 60 + st_m
             end_min = en_h * 60 + en_m
             if end_min <= start_min:
-                end_min += 24 * 60
+                end_min += 24 * 60  # overnight
 
-            NO_HEAD, NO_TAIL, GAP = 60, 60, 120
+            # constraints
+            NO_HEAD, NO_TAIL, GAP = 60, 60, 120  # no break in first/last hour; 2h gap
             place_start = start_min + NO_HEAD
             place_end = end_min - NO_TAIL
             if place_end - place_start < (15 + 30 + 15 + 2 * GAP):
                 item["breaks"] = []
                 continue
 
+            # anchor targets: lunch ~ mid; 15m ~ ~2h before/after lunch
             mid = (start_min + end_min) // 2
             lunch_target = clamp(mid, place_start + GAP // 2, place_end - GAP // 2)
             b1_target = clamp(lunch_target - GAP - 45, place_start, place_end)
             b3_target = clamp(lunch_target + GAP + 45, place_start, place_end)
 
-            def window(center, dur):
-                w_lo = clamp(center - 60, place_start, place_end - dur)
-                w_hi = clamp(center + 60, place_start, place_end - dur)
-                candidates = [t for t in time_list if w_lo <= t <= w_hi]
-                return candidates or [snap_to_grid(center)]
-
-            lunch_c = window(lunch_target, 30)
-            lunch_s = pick_best_slot(lunch_c, 30, demand, assigned) or snap_to_grid(lunch_target)
+            # pick LUNCH (30) first with fairness cap
+            lunch_cands = window_candidates(lunch_target, 30, place_start, place_end)
+            lunch_s = choose_slot(lunch_cands, 30) or snap_to_grid(lunch_target)
             lunch_e = lunch_s + 30
+            # commit lunch to break_load
+            for t in time_list:
+                if lunch_s <= t < lunch_e:
+                    break_load[t] += 1
 
+            # FIRST 15 before lunch (respect GAP)
             b1_end_allowed = lunch_s - GAP
-            b1_c = [t for t in window(b1_target, 15) if (t + 15) <= b1_end_allowed]
-            if not b1_c:
-                b1_c = [t for t in time_list if place_start <= t <= max(place_start, lunch_s - GAP - 15)]
-            b1_s = pick_best_slot(b1_c, 15, demand, assigned) if b1_c else None
+            b1_cands = [t for t in window_candidates(b1_target, 15, place_start, place_end)
+                        if (t + 15) <= b1_end_allowed]
+            if not b1_cands:
+                b1_cands = [t for t in time_list if place_start <= t <= max(place_start, lunch_s - GAP - 15)]
+            b1_s = choose_slot(b1_cands, 15) if b1_cands else None
             if b1_s is None and place_start + 15 <= b1_end_allowed:
                 b1_s = snap_to_grid(max(place_start, min(b1_target, b1_end_allowed - 15)))
             b1_e = b1_s + 15 if b1_s is not None else None
+            # commit b1
+            if b1_s is not None:
+                for t in time_list:
+                    if b1_s <= t < b1_e:
+                        break_load[t] += 1
 
+            # LAST 15 after lunch (respect GAP)
             b3_start_allowed = lunch_e + GAP
-            b3_c = [t for t in window(b3_target, 15) if t >= b3_start_allowed]
-            if not b3_c:
-                b3_c = [t for t in time_list if min(place_end - 15, b3_target) <= t <= (place_end - 15)]
-            b3_s = pick_best_slot(b3_c, 15, demand, assigned) if b3_c else None
+            b3_cands = [t for t in window_candidates(b3_target, 15, place_start, place_end)
+                        if t >= b3_start_allowed]
+            if not b3_cands:
+                b3_cands = [t for t in time_list if min(place_end - 15, b3_target) <= t <= (place_end - 15)]
+            b3_s = choose_slot(b3_cands, 15) if b3_cands else None
             if b3_s is None and b3_start_allowed <= (place_end - 15):
                 b3_s = snap_to_grid(min(place_end - 15, max(b3_target, b3_start_allowed)))
             b3_e = b3_s + 15 if b3_s is not None else None
+            # commit b3
+            if b3_s is not None:
+                for t in time_list:
+                    if b3_s <= t < b3_e:
+                        break_load[t] += 1
 
+            # attach to roster item
             item["breaks"] = []
             if b1_s is not None:
                 item["breaks"].append({
@@ -418,6 +512,7 @@ def generate_roster(req: RosterRequest):
                     "end": minutes_to_hhmm(b3_e % (24 * 60)),
                     "kind": "break15"
                 })
+
     except Exception as e:
         print("[break planning] skipped due to error:", e)
         for item in roster:
