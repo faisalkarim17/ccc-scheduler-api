@@ -741,21 +741,35 @@ def export_requirements_csv(
     return "\n".join(lines) + "\n"
 
 @app.get("/export/roster.csv", response_class=PlainTextResponse)
-def export_roster_csv(date: str = Query(..., description="dd-mm-yyyy")):
-    day = generate_roster(RosterRequest(date=date))
+def export_roster_csv(
+    date: str = Query(..., description="dd-mm-yyyy"),
+    language: Optional[str] = None,
+    grp: Optional[str] = None,
+):
+    # Build the roster using the same filters the UI uses
+    day = generate_roster(RosterRequest(date=date, language=language, grp=grp))
+
     header = ["date","agent_id","full_name","site_id","shift","breaks"]
     lines = [",".join(header)]
+
+    # If there’s no roster (no demand or no matching forecasts), still return a valid CSV
     for r in day.get("roster", []):
-        breaks = json.dumps(r.get("breaks") or [])
+        breaks = json.dumps(r.get("breaks") or []).replace("\n", "")
         lines.append(",".join([
             date,
             str(r.get("agent_id","")),
             str(r.get("full_name","")),
             str(r.get("site_id","")),
             str(r.get("shift","")),
-            breaks.replace("\n",""),
+            breaks,
         ]))
+
+    if len(lines) == 1:
+        # header only
+        return ",".join(header) + "\n"
+
     return "\n".join(lines) + "\n"
+
 
 # ============================================================================
 # Playground — dd-mm-yyyy
