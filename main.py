@@ -1791,7 +1791,7 @@ def swap_request(body: SwapRequestIn):
         applied = True
 
     return {"status": "ok", "created": True, "auto_applied": applied}
-from fastapi import Request
+
 
 @app.post("/swap/approve")
 @require_role("scheduler", "supervisor", "admin")
