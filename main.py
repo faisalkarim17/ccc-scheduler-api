@@ -32,7 +32,7 @@ app = FastAPI(title="CCC Scheduler API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten later (e.g., your Vercel domain)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,9 +51,23 @@ def parse_ddmmyyyy(d: str) -> str:
 def to_ddmmyyyy(iso: str) -> str:
     return datetime.strptime(iso, "%Y-%m-%d").strftime("%d-%m-%Y")
 
-def hhmm_to_minutes(hhmm: str) -> int:
-    hh, mm = hhmm.split(":")
-    return int(hh) * 60 + int(mm)
+def norm_hhmm(hhmm_or_hhmmss: str) -> str:
+    """Return HH:MM from HH:MM or HH:MM:SS."""
+    parts = hhmm_or_hhmmss.split(":")
+    if len(parts) >= 2:
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    # fallback
+    return hhmm_or_hhmmss[:5]
+
+def hhmm_to_minutes(h: str) -> int:
+    """
+    Accepts 'HH:MM' or 'HH:MM:SS'. Returns minutes since 00:00.
+    """
+    parts = h.split(":")
+    if len(parts) < 2:
+        raise HTTPException(400, f"Invalid time '{h}'. Expected HH:MM or HH:MM:SS.")
+    hh = int(parts[0]); mm = int(parts[1])
+    return hh * 60 + mm
 
 def minutes_to_hhmm(m: int) -> str:
     hh = (m // 60) % 24
@@ -75,13 +89,13 @@ CONFIG: Dict[str, Any] = {
     "shift_minutes": 9 * 60,          # default 9h
     "break_pattern": [15, 30, 15],     # minutes
     "break_cap_frac": 0.25,            # <= 25% of assigned on break concurrently
-    "no_head": 60,                     # no breaks first X mins of shift
-    "no_tail": 60,                     # no breaks last X mins of shift
-    "lunch_gap": 120,                  # minutes before/after lunch
+    "no_head": 60,
+    "no_tail": 60,
+    "lunch_gap": 120,
 
     "site_hours_enforced": False,
     "site_hours": {},                  # e.g., {"QA":{"open":"10:00","close":"19:00"}}
-    "rest_min_minutes": 12 * 60,       # cross-day rest
+    "rest_min_minutes": 12 * 60,
     "prev_end_times": {},              # {agent_id : "YYYY-MM-DDTHH:MM:SS"}
     "timezone": "UTC",
 }
@@ -122,10 +136,9 @@ def required_agents_for_target(volume: int, aht_sec: int, interval_seconds: int,
                                target_sl: float, target_t: int) -> int:
     if volume <= 0:
         return 0
-    lam = volume / interval_seconds      # arrivals per second
-    mu = 1.0 / max(aht_sec, 1)           # service rate per agent
-    a = lam / mu                         # offered load
-
+    lam = volume / interval_seconds
+    mu = 1.0 / max(aht_sec, 1)
+    a = lam / mu
     N = max(1, ceil(a))
     for _ in range(200):
         if N <= a:
@@ -180,9 +193,9 @@ def list_forecasts(
     if r.status_code != 200:
         raise HTTPException(r.status_code, r.text)
     rows = r.json()
-    # Convert output date to dd-mm-yyyy for UI consistency
     for row in rows:
         row["date"] = to_ddmmyyyy(row["date"])
+        row["interval_time"] = norm_hhmm(row["interval_time"])
     return rows
 
 # -----------------------------
@@ -225,7 +238,7 @@ def requirements(
         req_after = N_core if shrinkage >= 0.99 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
         out.append({
             "date": to_ddmmyyyy(row["date"]),
-            "interval_time": row["interval_time"],
+            "interval_time": norm_hhmm(row["interval_time"]),
             "language": row["language"],
             "grp": row["grp"],
             "service": row["service"],
@@ -240,7 +253,7 @@ def requirements(
 # Body models
 # -----------------------------
 class RosterRequest(BaseModel):
-    date: str                    # dd-mm-yyyy
+    date: str
     language: Optional[str] = None
     grp: Optional[str] = None
     shrinkage: Optional[float] = None
@@ -249,13 +262,13 @@ class RosterRequest(BaseModel):
     target_t: Optional[int] = None
 
 class RangeRequest(BaseModel):
-    date_from: str               # dd-mm-yyyy
-    date_to: str                 # dd-mm-yyyy
+    date_from: str
+    date_to: str
     language: Optional[str] = None
     grp: Optional[str] = None
 
 class SaveRosterRequest(BaseModel):
-    date: str                    # dd-mm-yyyy
+    date: str
     roster: List[Dict[str, Any]]
 
 # -----------------------------
@@ -266,7 +279,6 @@ def generate_roster(req: RosterRequest):
     if not REST_BASE:
         raise HTTPException(500, "Supabase env vars missing")
 
-    # resolve config overrides (fall back to CONFIG)
     interval_seconds = req.interval_seconds or CONFIG["interval_seconds"]
     target_sl = req.target_sl if req.target_sl is not None else CONFIG["target_sl"]
     target_t = req.target_t if req.target_t is not None else CONFIG["target_t"]
@@ -274,7 +286,7 @@ def generate_roster(req: RosterRequest):
 
     iso = parse_ddmmyyyy(req.date)
 
-    # 1) pull forecasts for the day (filtered)
+    # forecasts
     f_params = {
         "select": "date,interval_time,language,grp,service,volume,aht_sec",
         "date": f"eq.{iso}",
@@ -292,9 +304,9 @@ def generate_roster(req: RosterRequest):
         aht = int(row["aht_sec"])
         N_core = required_agents_for_target(vol, aht, interval_seconds, target_sl, target_t)
         req_after = N_core if shrinkage >= 0.99 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
-        intervals.append({"t": row["interval_time"], "lang": row["language"], "grp": row["grp"], "req": req_after})
+        intervals.append({"t": norm_hhmm(row["interval_time"]), "lang": row["language"], "grp": row["grp"], "req": req_after})
 
-    # 2) pull agents from Supabase
+    # agents
     ar = httpx.get(
         f"{REST_BASE}/agents",
         headers=HEADERS,
@@ -304,7 +316,6 @@ def generate_roster(req: RosterRequest):
     ar.raise_for_status()
     agents = ar.json()
 
-    # basic filter by capability
     if req.language or req.grp:
         pool = [ag for ag in agents if
                 (not req.language or (ag["primary_language"] == req.language or ag["secondary_language"] == req.language)) and
@@ -312,14 +323,13 @@ def generate_roster(req: RosterRequest):
     else:
         pool = agents[:]
 
-    # 3) greedy assignment on 30-min grid
+    # greedy assignment
     times = sorted({hhmm_to_minutes(x["t"]) for x in intervals})
     times_map = {t: [iv for iv in intervals if hhmm_to_minutes(iv["t"]) == t] for t in times}
     demand = {t: sum(iv["req"] for iv in times_map[t]) for t in times}
     assigned = {t: 0 for t in times}
 
     SHIFT_MIN = CONFIG["shift_minutes"]
-
     roster: List[Dict[str, Any]] = []
     used = set()
 
@@ -338,17 +348,14 @@ def generate_roster(req: RosterRequest):
             for ag in pool:
                 if ag["agent_id"] in used:
                     continue
-                # site hours rule (optional)
                 if CONFIG["site_hours_enforced"]:
                     site = ag.get("site_id")
                     sh = CONFIG["site_hours"].get(site) if site else None
                     if sh:
                         o = hhmm_to_minutes(sh["open"])
                         c = hhmm_to_minutes(sh["close"])
-                        # require the entire shift inside site window
                         if not (o <= start_min and end_min <= c):
                             continue
-                # cross-day rest rule
                 prev_end = CONFIG["prev_end_times"].get(ag["agent_id"])
                 if prev_end:
                     try:
@@ -369,7 +376,7 @@ def generate_roster(req: RosterRequest):
                 "agent_id": pick["agent_id"],
                 "full_name": pick["full_name"],
                 "site_id": pick.get("site_id"),
-                "date": req.date,  # keep dd-mm-yyyy for output
+                "date": req.date,
                 "shift": f"{minutes_to_hhmm(start_min)} - {minutes_to_hhmm(end_min % (24*60))}",
                 "notes": "stub assignment"
             })
@@ -379,7 +386,7 @@ def generate_roster(req: RosterRequest):
             if all(assigned[t] >= demand[t] for t in times):
                 break
 
-    # 4) Break planning with fairness caps
+    # break planning
     try:
         time_list = sorted(times)
 
@@ -419,7 +426,6 @@ def generate_roster(req: RosterRequest):
                         best_sc = sc; best = s
             if best is not None:
                 return best
-            # minimal violation fallback
             best = None; best_pen = None; best_sc = None
             for s in cands:
                 e = s + dur; pen = 0; sc = 0
@@ -459,7 +465,6 @@ def generate_roster(req: RosterRequest):
             mid = (start_min + end_min)//2
             lunch_target = clamp(mid, place_start + GAP//2, place_end - GAP//2)
 
-            # lunch first (pattern[1] assumed the long one)
             lunch_dur = max(10, int(pattern[1]))
             lunch_cands = window_candidates(lunch_target, lunch_dur, place_start, place_end)
             lunch_s = choose_slot(lunch_cands, lunch_dur) or snap_to_grid(lunch_target)
@@ -468,7 +473,6 @@ def generate_roster(req: RosterRequest):
                 if lunch_s <= t < lunch_e:
                     break_load[t] += 1
 
-            # first small break before lunch
             b1_dur = max(5, int(pattern[0]))
             b1_end_allowed = lunch_s - GAP
             b1_cands = [t for t in window_candidates(lunch_s - GAP - 45, b1_dur, place_start, place_end)
@@ -480,7 +484,6 @@ def generate_roster(req: RosterRequest):
                     if b1_s <= t < b1_e:
                         break_load[t] += 1
 
-            # final small break after lunch
             b3_dur = max(5, int(pattern[2]))
             b3_start_allowed = lunch_e + GAP
             b3_cands = [t for t in window_candidates(lunch_s + GAP + 45, b3_dur, place_start, place_end)
@@ -508,9 +511,9 @@ def generate_roster(req: RosterRequest):
 
     summary = {
         "date": req.date,
-        "intervals": [{"time": minutes_to_hhmm(t), "req": demand[t],
-                       "assigned": assigned[t],
-                       "on_break": 0, "working": assigned[t]} for t in times],
+        "intervals": [{"time": minutes_to_hhmm(t), "req": demand.get(t, 0),
+                       "assigned": assigned.get(t, 0),
+                       "on_break": 0, "working": assigned.get(t, 0)} for t in times],
         "agents_used": len(used),
         "roster": roster,
         "notes": [
@@ -545,7 +548,7 @@ def roster_range(req: RangeRequest):
     return out
 
 # -----------------------------
-# Save roster to Supabase (optional)
+# Save roster
 # -----------------------------
 @app.post("/save-roster")
 def save_roster(req: SaveRosterRequest):
@@ -554,7 +557,6 @@ def save_roster(req: SaveRosterRequest):
     if not isinstance(req.roster, list):
         raise HTTPException(400, "roster must be a list")
 
-    # convert date back to iso for DB
     iso = parse_ddmmyyyy(req.date)
     payload = []
     for item in req.roster:
@@ -565,7 +567,7 @@ def save_roster(req: SaveRosterRequest):
             "site_id": item.get("site_id"),
             "shift": item.get("shift"),
             "breaks": item.get("breaks") or [],
-            "meta": item,  # stash entire item for now
+            "meta": item,
         })
     if not payload:
         return {"status": "ok", "inserted": 0}
@@ -589,7 +591,6 @@ def get_config():
 
 @app.put("/config")
 def put_config(body: Dict[str, Any]):
-    # allow partial updates
     CONFIG.update({k: v for k, v in body.items() if k in CONFIG})
     return CONFIG
 
