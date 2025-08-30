@@ -1,4 +1,5 @@
-# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M10 explainability + free-text config
+# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O)
+# M10 explainability + free-text config  •  M11 shift-swaps (+ /rosters reader)
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -292,6 +293,17 @@ def sb_post(table: str, rows: List[Dict[str, Any]]) -> None:
     if r.status_code not in (200, 201):
         raise HTTPException(r.status_code, r.text)
 
+def sb_upsert(table: str, rows: List[Dict[str, Any]], on_conflict: str) -> None:
+    r = httpx.post(
+        f"{REST_BASE}/{table}",
+        headers={**HEADERS_WRITE, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+        params={"on_conflict": on_conflict},
+        content=json.dumps(rows),
+        timeout=30,
+    )
+    if r.status_code not in (200, 201):
+        raise HTTPException(r.status_code, r.text)
+
 # ----------------------------------------------------------------------------- #
 # Thin list endpoints
 # ----------------------------------------------------------------------------- #
@@ -450,6 +462,19 @@ class ExplainRequest(BaseModel):
 
 class ParseConfigRequest(BaseModel):
     text: str
+
+# M11 swap models
+class SwapRequestIn(BaseModel):
+    date: str                # dd-mm-yyyy
+    agent_from: str
+    agent_to: str
+    reason: Optional[str] = None
+    force: Optional[bool] = False  # auto-approve & apply immediately
+
+class SwapDecisionIn(BaseModel):
+    id: str                  # UUID of swap request
+    approver: Optional[str] = None
+    notes: Optional[str] = None
 
 # ----------------------------------------------------------------------------- #
 # Fairness helpers (last 7 days)
@@ -922,7 +947,6 @@ def explain_assignment(req: ExplainRequest):
     if not REST_BASE:
         raise HTTPException(500, "Supabase env vars missing")
 
-    # replay the same knobs used by /generate-roster (defaults)
     r = RosterRequest(
         date=req.date, language=req.language, grp=req.grp, service=req.service,
         interval_seconds=CONFIG["interval_seconds"], target_sl=CONFIG["target_sl"],
@@ -935,7 +959,6 @@ def explain_assignment(req: ExplainRequest):
     if not intervals:
         return {"explain": "No forecast intervals on this date with given filters.", "eligible": False}
 
-    # candidate starts & target daypart of dominant start
     times = sorted({hhmm_to_minutes(x["t"]) for x in intervals})
     SHIFT_MIN = CONFIG["shift_minutes"]
     def shift_gain(start_min):
@@ -945,7 +968,6 @@ def explain_assignment(req: ExplainRequest):
     candidate_starts = sorted({t for t in times}, key=lambda s: -shift_gain(s))
     target_dp = infer_daypart(candidate_starts[0], dp_bounds or get_daypart_bounds(CONFIG["rules"]["dayparts"]))
 
-    # agent pool
     sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
     agents = sb_get("agents", {"select": sel, "limit": 2000})
     for ag in agents:
@@ -953,14 +975,12 @@ def explain_assignment(req: ExplainRequest):
         ag["trained_services"] = ensure_list(ag.get("trained_services"))
 
     def eligible(ag):
-        # skills
         if r.language and not (ag.get("primary_language")==r.language or ag.get("secondary_language")==r.language):
             return False, "language_mismatch"
         if r.grp and (r.grp not in ag.get("trained_groups", [])):
             return False, "group_not_trained"
         if r.service and (r.service not in ag.get("trained_services", []) and ag.get("trained_services")):
             return False, "service_not_trained"
-        # site hours
         if CONFIG["site_hours_enforced"]:
             site = ag.get("site_id"); sh = CONFIG["site_hours"].get(site) if site else None
             if sh and sh.get("open") and sh.get("close"):
@@ -968,7 +988,6 @@ def explain_assignment(req: ExplainRequest):
                 st = candidate_starts[0]; en = st + SHIFT_MIN
                 if not (o <= st and en <= c):
                     return False, "outside_site_hours"
-        # rest
         prev_end = CONFIG["prev_end_times"].get(ag["agent_id"])
         if prev_end:
             try:
@@ -978,7 +997,6 @@ def explain_assignment(req: ExplainRequest):
                     return False, "insufficient_rest"
             except Exception:
                 pass
-        # hard: night cap
         if target_dp == "night":
             max_nights = int(rules.get("hard", {}).get("max_nights_per_7d", 2))
             ct = _ledger_count_in_window(ag["agent_id"], "night", iso, 7)
@@ -986,7 +1004,6 @@ def explain_assignment(req: ExplainRequest):
                 return False, "night_cap_reached"
         return True, "ok"
 
-    # scoring for all
     scored = []
     for ag in agents:
         ok, why = eligible(ag)
@@ -1020,12 +1037,10 @@ def _pct(s: str) -> float:
     return float(s) / 100.0
 
 def _hours_to_min(s: str) -> int:
-    # "9h", "9 h", "9 hour(s)"
     m = re.search(r"(\d+)\s*h", s, flags=re.I)
     return int(m.group(1))*60 if m else int(s)
 
 def _parse_dayparts(text: str) -> Dict[str, List[str]]:
-    # e.g. "dayparts: morning 06:00-14:00, evening 14:00-22:00, night 22:00-06:00"
     dps = {}
     for name, start, end in re.findall(r"(morning|evening|night)\s+(\d{1,2}:\d{2})\s*[-to]+\s*(\d{1,2}:\d{2})", text, flags=re.I):
         dps[name.lower()] = [start, end]
@@ -1040,29 +1055,23 @@ def parse_config(req: ParseConfigRequest, apply: bool = Query(False)):
     proposed: Dict[str, Any] = {}
     rules = proposed.setdefault("rules", {}); buffers = rules.setdefault("buffers", {}); hard = rules.setdefault("hard", {})
 
-    # service level
     m = re.search(r"(service\s*level|target\s*sl)[^\d%]*?(\d{1,3})\s*%", text, flags=re.I)
     if m: proposed["target_sl"] = round(_pct(m.group(2)), 4)
 
-    # target answer time
     m = re.search(r"(target\s*(t|asa|answer\s*time))[^\d]*?(\d{1,4})\s*(sec|s)", text, flags=re.I)
     if m: proposed["target_t"] = int(m.group(3))
 
-    # shrinkage
     m = re.search(r"(shrinkage)[^\d%]*?(\d{1,3})\s*%", text, flags=re.I)
     if m: proposed["shrinkage"] = round(_pct(m.group(2)), 4)
 
-    # shift length
     m = re.search(r"(shift\s*(minutes|length|duration))[^\d]*?(\d{1,2})\s*(h|hour)", text, flags=re.I)
     if m: proposed["shift_minutes"] = int(m.group(3)) * 60
     m = re.search(r"(shift\s*(minutes|length|duration))[^\d]*?(\d{2,4})\s*min", text, flags=re.I)
     if m: proposed["shift_minutes"] = int(m.group(3))
 
-    # breaks pattern
     m = re.search(r"break\s*pattern[^0-9]*(\d{1,2})\D+(\d{1,2})\D+(\d{1,2})", text, flags=re.I)
     if m: proposed["break_pattern"] = [int(m.group(1)), int(m.group(2)), int(m.group(3))]
 
-    # weekday/weekend/night buffers
     m = re.search(r"weekday\s*buffer[^0-9%]*(\d{1,2})\s*%", text, flags=re.I)
     if m: buffers["weekday_pct"] = round(_pct(m.group(1)), 4)
     m = re.search(r"weekend\s*buffer[^0-9%]*(\d{1,2})\s*%", text, flags=re.I)
@@ -1070,27 +1079,22 @@ def parse_config(req: ParseConfigRequest, apply: bool = Query(False)):
     m = re.search(r"(night\s*buffer|buffer\s*for\s*night)[^0-9%]*(\d{1,2})\s*%", text, flags=re.I)
     if m: buffers["night_pct"] = round(_pct(m.group(2)), 4)
 
-    # hard rule: max nights per 7d
     m = re.search(r"(max\s*nights?|night\s*cap)[^\d]*?(\d{1,2})\s*(per|/)\s*7", text, flags=re.I)
     if m: hard["max_nights_per_7d"] = int(m.group(2))
 
-    # rest min hours
     m = re.search(r"(rest|minimum\s*rest)[^\d]*?(\d{1,2})\s*(h|hour)", text, flags=re.I)
     if m: proposed["rest_min_minutes"] = int(m.group(2)) * 60
 
-    # site hours enforced on/off
     if re.search(r"(enforce\s*site\s*hours)\s*(on|true|enable)", text, flags=re.I):
         proposed["site_hours_enforced"] = True
     if re.search(r"(enforce\s*site\s*hours)\s*(off|false|disable)", text, flags=re.I):
         proposed["site_hours_enforced"] = False
 
-    # dayparts definition
     dps = _parse_dayparts(text)
     if dps:
         rules.setdefault("dayparts", {})
         rules["dayparts"].update(dps)
 
-    # cleanup empty subdicts
     if not buffers: rules.pop("buffers", None)
     if not hard: rules.pop("hard", None)
     if not rules: proposed.pop("rules", None)
@@ -1099,7 +1103,6 @@ def parse_config(req: ParseConfigRequest, apply: bool = Query(False)):
         return {"applied": False, "proposed_changes": {}, "message": "No recognized settings in text."}
 
     if apply:
-        # merge into CONFIG (shallow for top-level; deep for rules)
         for k, v in proposed.items():
             if k == "rules":
                 cur = CONFIG.setdefault("rules", {})
@@ -1121,7 +1124,7 @@ def parse_config(req: ParseConfigRequest, apply: bool = Query(False)):
     return {"applied": False, "proposed_changes": proposed}
 
 # ----------------------------------------------------------------------------- #
-# CSV exports (unchanged except requirements new column already included)
+# CSV exports
 # ----------------------------------------------------------------------------- #
 @app.get("/export/requirements.csv", response_class=PlainTextResponse)
 def export_requirements_csv(
@@ -1241,3 +1244,195 @@ function runRange() {{
 </body></html>
 """
     return HTMLResponse(html)
+
+# ----------------------------------------------------------------------------- #
+# NEW — Convenience: read persisted rosters by date range (for verification)
+# ----------------------------------------------------------------------------- #
+@app.get("/rosters")
+def rosters(
+    date_from: str = Query(..., description="dd-mm-yyyy"),
+    date_to: str = Query(..., description="dd-mm-yyyy"),
+    agent_id: Optional[str] = None,
+):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso_from = parse_ddmmyyyy(date_from)
+    iso_to = parse_ddmmyyyy(date_to)
+    params = {
+        "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
+        "date": f"gte.{iso_from}",
+        "order": "date.asc,agent_id.asc"
+    }
+    # Supabase REST doesn't support combined gte/lte in one param; chain 'and' via 'and='
+    # Simpler: filter lte after fetch; or do two filters with 'and' … for brevity, fetch window and filter client-side.
+    rows = sb_get("rosters", params)
+    out = []
+    for r in rows:
+        if r["date"] <= iso_to and (not agent_id or r.get("agent_id")==agent_id):
+            r["date"] = to_ddmmyyyy(r["date"])
+            out.append(r)
+    return out
+
+# ----------------------------------------------------------------------------- #
+# NEW — M11: Shift swap requests + approvals + commit
+# ----------------------------------------------------------------------------- #
+def _iso(d_ddmmyyyy: str) -> str:
+    return parse_ddmmyyyy(d_ddmmyyyy)
+
+def _get_roster_row(iso_date: str, agent_id: str) -> Optional[Dict[str, Any]]:
+    rows = sb_get("rosters", {
+        "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
+        "date": f"eq.{iso_date}",
+        "agent_id": f"eq.{agent_id}",
+        "limit": 1
+    })
+    return rows[0] if rows else None
+
+def _load_agent(agent_id: str) -> Optional[Dict[str, Any]]:
+    sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
+    rows = sb_get("agents", {"select": sel, "agent_id": f"eq.{agent_id}", "limit": 1})
+    if rows:
+        rows[0]["trained_groups"] = ensure_list(rows[0].get("trained_groups"))
+        rows[0]["trained_services"] = ensure_list(rows[0].get("trained_services"))
+        return rows[0]
+    return None
+
+def _check_capability_for_swap(agent: Dict[str, Any], target_meta: Dict[str, Any]) -> Tuple[bool, str]:
+    # Minimal: verify service coverage if service present in meta
+    svc = (target_meta or {}).get("service")
+    if svc:
+        trained = ensure_list(agent.get("trained_services"))
+        if trained and svc not in trained:
+            return False, "service_not_trained"
+    return True, "ok"
+
+def _apply_swap_to_db(iso_date: str, a_from: str, a_to: str):
+    """Swap the shift strings between two agents; keep each row's own breaks/meta."""
+    r_from = _get_roster_row(iso_date, a_from)
+    r_to   = _get_roster_row(iso_date, a_to)
+    if not r_from or not r_to:
+        raise HTTPException(400, "One or both agents have no persisted roster on this date.")
+
+    new_from = dict(r_from)
+    new_to   = dict(r_to)
+    new_from["shift"], new_to["shift"] = r_to.get("shift"), r_from.get("shift")
+
+    # Keep meta; if you want to also swap meta.service, uncomment below:
+    # mf = dict(new_from.get("meta") or {}); mt = dict(new_to.get("meta") or {})
+    # mf_svc, mt_svc = mf.get("service"), mt.get("service")
+    # mf["service"], mt["service"] = mt_svc, mf_svc
+    # new_from["meta"] = mf; new_to["meta"] = mt
+
+    # Persist as new rows (historical trail). If you want hard updates, add a PK and use upsert.
+    sb_post("rosters", [new_from, new_to])
+
+@app.get("/swap/list")
+def swap_list(
+    status: Optional[str] = Query(None),
+    date: Optional[str] = Query(None, description="dd-mm-yyyy"),
+    agent_id: Optional[str] = None,
+):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    params = {"select": "*", "order": "created_at.desc"}
+    if status:
+        params["status"] = f"eq.{status}"
+    if date:
+        params["date"] = f"eq.{parse_ddmmyyyy(date)}"
+    if agent_id:
+        params["or"] = f"(agent_from.eq.{agent_id},agent_to.eq.{agent_id})"
+    return sb_get("swap_requests", params)
+
+@app.post("/swap/request")
+def swap_request(body: SwapRequestIn):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso = _iso(body.date)
+
+    r_from = _get_roster_row(iso, body.agent_from)
+    r_to   = _get_roster_row(iso, body.agent_to)
+    if not r_from or not r_to:
+        raise HTTPException(400, "Both agents need an existing roster saved for this date.")
+
+    ag_from = _load_agent(body.agent_from) or {}
+    ag_to   = _load_agent(body.agent_to) or {}
+    ok_to, why_to = _check_capability_for_swap(ag_to, r_from.get("meta") or {})
+    ok_from, why_from = _check_capability_for_swap(ag_from, r_to.get("meta") or {})
+    if not ok_to:
+        raise HTTPException(400, f"Agent_to cannot cover agent_from shift: {why_to}")
+    if not ok_from:
+        raise HTTPException(400, f"Agent_from cannot cover agent_to shift: {why_from}")
+
+    record = {
+        "date": iso,
+        "agent_from": body.agent_from,
+        "agent_to": body.agent_to,
+        "status": "approved" if body.force else "pending",
+        "reason": body.reason or "",
+        "meta": {"from": r_from, "to": r_to}
+    }
+    sb_post("swap_requests", [record])
+
+    applied = False
+    if body.force:
+        _apply_swap_to_db(iso, body.agent_from, body.agent_to)
+        applied = True
+
+    return {"status": "ok", "created": True, "auto_applied": applied}
+
+@app.post("/swap/approve")
+def swap_approve(body: SwapDecisionIn):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    reqs = sb_get("swap_requests", {"select": "*", "id": f"eq.{body.id}", "limit": 1})
+    if not reqs:
+        raise HTTPException(404, "Swap request not found")
+    req = reqs[0]
+    if req.get("status") != "pending":
+        raise HTTPException(400, f"Swap request is {req.get('status')}, not pending")
+
+    iso = req["date"]; a_from = req["agent_from"]; a_to = req["agent_to"]
+    r_from = _get_roster_row(iso, a_from)
+    r_to   = _get_roster_row(iso, a_to)
+    if not r_from or not r_to:
+        raise HTTPException(400, "Both agents need an existing roster saved for this date.")
+
+    ag_from = _load_agent(a_from) or {}
+    ag_to   = _load_agent(a_to) or {}
+    ok_to, _ = _check_capability_for_swap(ag_to, r_from.get("meta") or {})
+    ok_from, _ = _check_capability_for_swap(ag_from, r_to.get("meta") or {})
+    if not ok_to or not ok_from:
+        raise HTTPException(400, "Capability check failed on approval.")
+
+    _apply_swap_to_db(iso, a_from, a_to)
+
+    update = dict(req)
+    update["status"] = "approved"
+    update["decision_by"] = body.approver or "approver"
+    update["decision_at"] = datetime.utcnow().isoformat()
+    sb_upsert("swap_requests", [update], on_conflict="id")
+
+    return {"status": "ok", "approved": True, "id": body.id}
+
+@app.post("/swap/deny")
+def swap_deny(body: SwapDecisionIn):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    reqs = sb_get("swap_requests", {"select": "*", "id": f"eq.{body.id}", "limit": 1})
+    if not reqs:
+        raise HTTPException(404, "Swap request not found")
+    req = reqs[0]
+    if req.get("status") != "pending":
+        raise HTTPException(400, f"Swap request is {req.get('status')}, not pending")
+
+    update = dict(req)
+    update["status"] = "denied"
+    update["decision_by"] = body.approver or "approver"
+    update["decision_at"] = datetime.utcnow().isoformat()
+    if body.notes:
+        m = dict(update.get("meta") or {})
+        m["decision_notes"] = body.notes
+        update["meta"] = m
+    sb_upsert("swap_requests", [update], on_conflict="id")
+
+    return {"status": "ok", "denied": True, "id": body.id}
