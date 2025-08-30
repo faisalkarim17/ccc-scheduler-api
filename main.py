@@ -1,4 +1,4 @@
-# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M6 service-aware
+# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M7 roster-range read/export
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -509,7 +509,7 @@ def generate_roster(req: RosterRequest):
                     "site_id": pick.get("site_id"),
                     "date": req.date,  # dd-mm-yyyy for output
                     "shift": f"{minutes_to_hhmm(start_min)} - {minutes_to_hhmm(end_min % (24*60))}",
-                    "service": req.service or "",  # tag if requested
+                    "service": req.service or "",
                     "notes": "auto assignment",
                 })
                 for t in times:
@@ -702,7 +702,6 @@ def roster_range(req: RangeRequest):
                     st_str, en_str = [s.strip() for s in sh.split("-")]
                     en_h, en_m = map(int, en_str.split(":"))
                     end_dt = datetime.strptime(iso + f"T{en_h:02d}:{en_m:02d}:00", "%Y-%m-%dT%H:%M:%S")
-                    # handle cross-midnight (rare in our simple shifts)
                     st_h, st_m = map(int, st_str.split(":"))
                     st_dt = datetime.strptime(iso + f"T{st_h:02d}:{st_m:02d}:00", "%Y-%m-%dT%H:%M:%S")
                     if end_dt <= st_dt:
@@ -724,6 +723,38 @@ def roster_range(req: RangeRequest):
             pass
 
     return out
+
+# ----------------------------------------------------------------------------- #
+# NEW IN M7 — read saved rosters over a range
+# ----------------------------------------------------------------------------- #
+@app.get("/rosters")
+def read_rosters(
+    date_from: str = Query(..., description="dd-mm-yyyy"),
+    date_to: str   = Query(..., description="dd-mm-yyyy"),
+    agent_id: Optional[str] = None,
+    site_id: Optional[str] = None,
+):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso_from = parse_ddmmyyyy(date_from)
+    iso_to   = parse_ddmmyyyy(date_to)
+    params = {
+        "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
+        "date": f"gte.{iso_from}",
+        "order": "date.asc,agent_id.asc"
+    }
+    # PostgREST range filter also needs upper bound
+    params["date"] = f"gte.{iso_from}"
+    params["and"] = f"(date.lte.{iso_to})"
+    if agent_id:
+        params["agent_id"] = f"eq.{agent_id}"
+    if site_id:
+        params["site_id"] = f"eq.{site_id}"
+
+    rows = sb_get("rosters", params)
+    for r in rows:
+        r["date"] = to_ddmmyyyy(r["date"])
+    return rows
 
 # ----------------------------------------------------------------------------- #
 # Save roster (single day) to Supabase
@@ -834,6 +865,36 @@ def export_roster_csv(
             str(r.get("site_id","")),
             str(r.get("shift","")),
             str(r.get("service","")),
+            breaks.replace("\n",""),
+        ]))
+    return "\n".join(lines) + "\n"
+
+# NEW IN M7 — CSV export of saved rosters over a range
+@app.get("/export/rosters-range.csv", response_class=PlainTextResponse)
+def export_rosters_range_csv(
+    date_from: str = Query(..., description="dd-mm-yyyy"),
+    date_to: str   = Query(..., description="dd-mm-yyyy"),
+    agent_id: Optional[str] = None,
+    site_id: Optional[str] = None,
+):
+    rows = read_rosters(date_from=date_from, date_to=date_to, agent_id=agent_id, site_id=site_id)
+    header = ["date","agent_id","full_name","site_id","shift","service","breaks"]
+    lines = [",".join(header)]
+    for r in rows:
+        breaks = json.dumps(r.get("breaks") or [])
+        svc = ""
+        try:
+            meta = r.get("meta") or {}
+            svc = meta.get("service","") if isinstance(meta, dict) else ""
+        except Exception:
+            svc = ""
+        lines.append(",".join([
+            r.get("date",""),
+            str(r.get("agent_id","")),
+            str(r.get("full_name","")),
+            str(r.get("site_id","")),
+            str(r.get("shift","")),
+            str(svc),
             breaks.replace("\n",""),
         ]))
     return "\n".join(lines) + "\n"
