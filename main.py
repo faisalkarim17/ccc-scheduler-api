@@ -1,27 +1,26 @@
-# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M5.1 hardened
+# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M6 service-aware
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from math import factorial, exp, ceil
-import os, httpx, json
-import logging
+import os, httpx, json, logging
 
-# -----------------------------------------------------------------------------
-# Logging (so Railway logs show useful, single-line root causes)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# Logging
+# ----------------------------------------------------------------------------- #
 log = logging.getLogger("ccc")
 log.setLevel(logging.INFO)
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Supabase REST setup (READ via ANON; WRITE via SERVICE_ROLE if provided)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # added in Railway
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # set in Railway
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     REST_BASE = None
@@ -33,29 +32,29 @@ else:
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
-    # Prefer service key for writes; otherwise fall back to anon (not recommended for prod)
+    # Prefer service key for writes
     _write_token = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
     HEADERS_WRITE = {
         "apikey": _write_token,
         "Authorization": f"Bearer {_write_token}",
     }
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # App + CORS
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 app = FastAPI(title="CCC Scheduler API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],  # tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Helpers — dates & time (UI uses dd-mm-yyyy; DB uses yyyy-mm-dd)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def parse_ddmmyyyy(d: str) -> str:
     """Input dd-mm-yyyy -> output yyyy-mm-dd (ISO, for DB)."""
     try:
@@ -67,18 +66,13 @@ def to_ddmmyyyy(iso: str) -> str:
     return datetime.strptime(iso, "%Y-%m-%d").strftime("%d-%m-%Y")
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    """
-    Accept 'HH:MM' or 'HH:MM:SS' (or anything starting with HH:MM...).
-    Returns minutes from midnight.
-    """
+    """Accept 'HH:MM' or 'HH:MM:SS' and return minutes from midnight."""
     s = str(hhmm)
     parts = s.split(":")
     if len(parts) < 2:
         raise ValueError(f"Bad time string '{hhmm}'")
-    hh = int(parts[0])
-    mm = int(parts[1])
+    hh = int(parts[0]); mm = int(parts[1])
     return hh * 60 + mm
-
 
 def minutes_to_hhmm(m: int) -> str:
     hh = (m // 60) % 24
@@ -89,17 +83,14 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def ensure_list(x) -> List[Any]:
-    """
-    Supabase text[] sometimes arrives as a JSON string or comma text.
-    Normalize to a Python list.
-    """
+    """Normalize Supabase text[]/json-ish fields to Python list."""
     if x is None:
         return []
     if isinstance(x, list):
         return x
     if isinstance(x, str):
         s = x.strip()
-        # try JSON-style list first
+        # JSON array?
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
             try:
                 v = json.loads(s)
@@ -107,35 +98,38 @@ def ensure_list(x) -> List[Any]:
                     return v
             except Exception:
                 pass
-        # fallback: split on comma and strip quotes/spaces
+        # Fallback comma-split
         parts = [p.strip().strip('"').strip("'") for p in s.split(",")]
         return [p for p in parts if p]
-    # anything else, box it
     return [x]
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # CONFIG — default (merged at startup from DB row id=1 in public.wfm_config)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 CONFIG_DEFAULT: Dict[str, Any] = {
+    # requirements
     "interval_seconds": 1800,
     "target_sl": 0.80,
     "target_t": 20,
     "shrinkage": 0.30,
 
-    "shift_minutes": 9 * 60,      # 9h
+    # scheduling
+    "shift_minutes": 9 * 60,
     "break_pattern": [15, 30, 15],
     "break_cap_frac": 0.25,
     "no_head": 60,
     "no_tail": 60,
     "lunch_gap": 120,
 
+    # constraints
     "site_hours_enforced": False,
-    "site_hours": {},            # {"QA":{"open":"10:00","close":"19:00"}}
+    "site_hours": {},                 # {"QA":{"open":"10:00","close":"19:00"}}
     "rest_min_minutes": 12 * 60,
-    "prev_end_times": {},
+    "prev_end_times": {},             # {"A001":"YYYY-MM-DDTHH:MM:SS"}
 
     "timezone": "UTC",
 
+    # scoring knobs
     "weight_primary_language": 2.0,
     "weight_secondary_language": 1.0,
     "weight_group_exact": 1.5,
@@ -177,9 +171,9 @@ async def save_config_to_db():
 async def _startup():
     await load_config_from_db()
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Health
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.get("/")
 def root():
     return {"status": "ok", "message": "CCC Scheduler API running"}
@@ -200,9 +194,9 @@ def health_db():
     except httpx.HTTPError as e:
         raise HTTPException(500, f"Supabase REST error: {e}")
 
-# -----------------------------------------------------------------------------
-# Erlang C & Requirements math
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# Erlang C & requirements math
+# ----------------------------------------------------------------------------- #
 def erlang_c(a: float, N: int) -> float:
     if N <= a:
         return 1.0
@@ -231,9 +225,9 @@ def required_agents_for_target(volume: int, aht_sec: int, interval_seconds: int,
         N += 1
     return N
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # DB helpers
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 def sb_get(table: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
     r = httpx.get(f"{REST_BASE}/{table}", headers=HEADERS_READ, params=params, timeout=30)
     if r.status_code != 200:
@@ -250,9 +244,9 @@ def sb_post(table: str, rows: List[Dict[str, Any]]) -> None:
     if r.status_code not in (200, 201):
         raise HTTPException(r.status_code, r.text)
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Thin list endpoints
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.get("/agents")
 def list_agents(
     limit: int = Query(100, ge=1, le=2000),
@@ -270,10 +264,8 @@ def list_agents(
     if language:
         params["or"] = f"(primary_language.eq.{language},secondary_language.eq.{language})"
     if grp:
-        # PostgREST array-contains for text[] is '@>' but using 'cs.{G1}' works for jsonb[] too.
         params["trained_groups"] = f"cs.{{{grp}}}"
     rows = sb_get("agents", params)
-    # normalize array-ish columns
     for ag in rows:
         ag["trained_groups"] = ensure_list(ag.get("trained_groups"))
         ag["trained_services"] = ensure_list(ag.get("trained_services"))
@@ -284,6 +276,7 @@ def list_forecasts(
     date: str = Query(..., description="dd-mm-yyyy"),
     language: Optional[str] = None,
     grp: Optional[str] = None,
+    service: Optional[str] = None,
 ):
     if not REST_BASE:
         raise HTTPException(500, "Supabase env vars missing")
@@ -291,25 +284,28 @@ def list_forecasts(
     params = {
         "select": "date,interval_time,language,grp,service,volume,aht_sec",
         "date": f"eq.{iso}",
-        "order": "interval_time.asc,language.asc,grp.asc",
+        "order": "interval_time.asc,language.asc,grp.asc,service.asc",
     }
     if language:
         params["language"] = f"eq.{language}"
     if grp:
         params["grp"] = f"eq.{grp}"
+    if service:
+        params["service"] = f"eq.{service}"
     rows = sb_get("forecasts", params)
     for row in rows:
         row["date"] = to_ddmmyyyy(row["date"])
     return rows
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Requirements (per-interval)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.get("/requirements")
 def requirements(
     date: str = Query(..., description="dd-mm-yyyy"),
     language: Optional[str] = None,
     grp: Optional[str] = None,
+    service: Optional[str] = None,
     interval_seconds: Optional[int] = None,
     target_sl: Optional[float] = None,
     target_t: Optional[int] = None,
@@ -327,18 +323,19 @@ def requirements(
     params = {
         "select": "date,interval_time,language,grp,service,volume,aht_sec",
         "date": f"eq.{iso}",
-        "order": "interval_time.asc,language.asc,grp.asc",
+        "order": "interval_time.asc,language.asc,grp.asc,service.asc",
     }
     if language:
         params["language"] = f"eq.{language}"
     if grp:
         params["grp"] = f"eq.{grp}"
+    if service:
+        params["service"] = f"eq.{service}"
 
     rows = sb_get("forecasts", params)
     out: List[Dict[str, Any]] = []
     for row in rows:
-        vol = int(row["volume"])
-        aht = int(row["aht_sec"])
+        vol = int(row["volume"]); aht = int(row["aht_sec"])
         N_core = required_agents_for_target(vol, aht, interval_seconds, target_sl, target_t)
         req_after = N_core if shrinkage >= 0.999 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
         out.append({
@@ -354,13 +351,14 @@ def requirements(
         })
     return out
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Models
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 class RosterRequest(BaseModel):
     date: str                    # dd-mm-yyyy
     language: Optional[str] = None
     grp: Optional[str] = None
+    service: Optional[str] = None
     shrinkage: Optional[float] = None
     interval_seconds: Optional[int] = None
     target_sl: Optional[float] = None
@@ -371,16 +369,17 @@ class RangeRequest(BaseModel):
     date_to: str                 # dd-mm-yyyy
     language: Optional[str] = None
     grp: Optional[str] = None
+    service: Optional[str] = None
     persist: Optional[bool] = False
 
 class SaveRosterRequest(BaseModel):
     date: str                    # dd-mm-yyyy
     roster: List[Dict[str, Any]]
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Scoring — pick best agents by skill/priority
-# -----------------------------------------------------------------------------
-def agent_score(agent: Dict[str, Any], language: Optional[str], grp: Optional[str]) -> float:
+# ----------------------------------------------------------------------------- #
+def agent_score(agent: Dict[str, Any], language: Optional[str], grp: Optional[str], service: Optional[str]) -> float:
     score = 0.0
     if language:
         if agent.get("primary_language") == language:
@@ -388,14 +387,16 @@ def agent_score(agent: Dict[str, Any], language: Optional[str], grp: Optional[st
         if agent.get("secondary_language") == language:
             score += CONFIG.get("weight_secondary_language", 1.0)
     if grp:
-        tg = ensure_list(agent.get("trained_groups"))
-        if grp in tg:
+        if grp in ensure_list(agent.get("trained_groups")):
             score += CONFIG.get("weight_group_exact", 1.5)
+    if service:
+        if service in ensure_list(agent.get("trained_services")):
+            score += CONFIG.get("weight_service_match", 1.0)
     return score
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Generate roster (single day)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.post("/generate-roster")
 def generate_roster(req: RosterRequest):
     try:
@@ -409,23 +410,26 @@ def generate_roster(req: RosterRequest):
 
         iso = parse_ddmmyyyy(req.date)
 
-        # forecasts
+        # forecasts -> intervals
         f_params = {
             "select": "date,interval_time,language,grp,service,volume,aht_sec",
             "date": f"eq.{iso}",
-            "order": "interval_time.asc,language.asc,grp.asc",
+            "order": "interval_time.asc,language.asc,grp.asc,service.asc",
             **({"language": f"eq.{req.language}"} if req.language else {}),
             **({"grp": f"eq.{req.grp}"} if req.grp else {}),
+            **({"service": f"eq.{req.service}"} if req.service else {}),
         }
         fc_rows = sb_get("forecasts", f_params)
 
         intervals = []
         for row in fc_rows:
-            vol = int(row["volume"])
-            aht = int(row["aht_sec"])
+            vol = int(row["volume"]); aht = int(row["aht_sec"])
             N_core = required_agents_for_target(vol, aht, interval_seconds, target_sl, target_t)
             req_after = N_core if shrinkage >= 0.999 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
-            intervals.append({"t": row["interval_time"], "lang": row["language"], "grp": row["grp"], "req": req_after})
+            intervals.append({
+                "t": row["interval_time"], "lang": row["language"],
+                "grp": row["grp"], "svc": row["service"], "req": req_after
+            })
 
         # agents
         sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
@@ -434,20 +438,23 @@ def generate_roster(req: RosterRequest):
             ag["trained_groups"] = ensure_list(ag.get("trained_groups"))
             ag["trained_services"] = ensure_list(ag.get("trained_services"))
 
-        # capability filter
-        if req.language or req.grp:
-            pool = [ag for ag in agents if
-                    (not req.language or (ag.get("primary_language") == req.language or ag.get("secondary_language") == req.language)) and
-                    (not req.grp or (req.grp in ag.get("trained_groups", [])))]
+        # candidate pool (capability filter)
+        if req.language or req.grp or req.service:
+            pool = [
+                ag for ag in agents
+                if (not req.language or (ag.get("primary_language") == req.language or ag.get("secondary_language") == req.language))
+                and (not req.grp or (req.grp in ag.get("trained_groups", [])))
+                and (not req.service or (req.service in ag.get("trained_services", []) or not ag.get("trained_services")))
+            ]
         else:
             pool = agents[:]
 
         # sort pool by score (desc)
-        pool.sort(key=lambda ag: agent_score(ag, req.language, req.grp), reverse=True)
+        pool.sort(key=lambda ag: agent_score(ag, req.language, req.grp, req.service), reverse=True)
 
-        # demand grid
+        # demand grid (sum across services unless req.service was provided)
         times = sorted({hhmm_to_minutes(x["t"]) for x in intervals})
-        times_map = {t: [iv for iv in intervals if hhmm_to_minutes(iv["t"]) == t] for t in times}
+        times_map: Dict[int, List[Dict[str, Any]]] = {t: [iv for iv in intervals if hhmm_to_minutes(iv["t"]) == t] for t in times}
         demand = {t: sum(iv["req"] for iv in times_map[t]) for t in times}
         assigned = {t: 0 for t in times}
 
@@ -500,8 +507,9 @@ def generate_roster(req: RosterRequest):
                     "agent_id": pick["agent_id"],
                     "full_name": pick["full_name"],
                     "site_id": pick.get("site_id"),
-                    "date": req.date,
+                    "date": req.date,  # dd-mm-yyyy for output
                     "shift": f"{minutes_to_hhmm(start_min)} - {minutes_to_hhmm(end_min % (24*60))}",
+                    "service": req.service or "",  # tag if requested
                     "notes": "auto assignment",
                 })
                 for t in times:
@@ -547,7 +555,6 @@ def generate_roster(req: RosterRequest):
                                 best_sc = sc; best = s
                     if best is not None:
                         return best
-                    # minimal violation fallback
                     best = None; best_pen = None; best_sc = None
                     for s in cands:
                         e = s + dur; pen = 0; sc = 0
@@ -651,9 +658,9 @@ def generate_roster(req: RosterRequest):
         log.error(f"[generate_roster] ERROR: {e}")
         raise HTTPException(500, "Internal Server Error")
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Generate roster for a range (+ optional persist)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.post("/generate-roster-range")
 def roster_range(req: RangeRequest):
     d0 = parse_ddmmyyyy(req.date_from)
@@ -669,7 +676,8 @@ def roster_range(req: RangeRequest):
         day_req = RosterRequest(
             date=to_ddmmyyyy(cur.strftime("%Y-%m-%d")),
             language=req.language,
-            grp=req.grp
+            grp=req.grp,
+            service=req.service,
         )
         day = generate_roster(day_req)
         out[cur.strftime("%Y-%m-%d")] = day
@@ -677,6 +685,7 @@ def roster_range(req: RangeRequest):
         if req.persist and day.get("roster"):
             iso = cur.strftime("%Y-%m-%d")
             rows = []
+            # also update prev_end_times in CONFIG as we go
             for item in day["roster"]:
                 rows.append({
                     "date": iso,
@@ -687,15 +696,38 @@ def roster_range(req: RangeRequest):
                     "breaks": item.get("breaks") or [],
                     "meta": item,
                 })
+                # update prev_end_times (compute end ISO)
+                try:
+                    sh = item.get("shift","")
+                    st_str, en_str = [s.strip() for s in sh.split("-")]
+                    en_h, en_m = map(int, en_str.split(":"))
+                    end_dt = datetime.strptime(iso + f"T{en_h:02d}:{en_m:02d}:00", "%Y-%m-%dT%H:%M:%S")
+                    # handle cross-midnight (rare in our simple shifts)
+                    st_h, st_m = map(int, st_str.split(":"))
+                    st_dt = datetime.strptime(iso + f"T{st_h:02d}:{st_m:02d}:00", "%Y-%m-%dT%H:%M:%S")
+                    if end_dt <= st_dt:
+                        end_dt = end_dt + timedelta(days=1)
+                    CONFIG["prev_end_times"][item["agent_id"]] = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                except Exception as e:
+                    log.info(f"[prev_end_times update skipped] {e}")
+
             if rows:
                 sb_post("rosters", rows)
-
         cur += timedelta(days=1)
+
+    # persist updated CONFIG if we touched prev_end_times
+    if req.persist:
+        try:
+            import anyio
+            anyio.from_thread.run(save_config_to_db)
+        except Exception:
+            pass
+
     return out
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Save roster (single day) to Supabase
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.post("/save-roster")
 def save_roster(req: SaveRosterRequest):
     if not REST_BASE:
@@ -719,9 +751,9 @@ def save_roster(req: SaveRosterRequest):
     sb_post("rosters", rows)
     return {"status": "ok", "inserted": len(rows)}
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Runtime config endpoints (DB-backed)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.get("/config")
 def get_config():
     return CONFIG
@@ -753,16 +785,28 @@ def import_config(new_conf: Dict[str, Any] = Body(...)):
         pass
     return {"status": "ok", "applied_keys": sorted(applied.keys())}
 
-# -----------------------------------------------------------------------------
+@app.post("/admin/config/reset-prev-end")
+def reset_prev_end():
+    n = len(CONFIG.get("prev_end_times", {}))
+    CONFIG["prev_end_times"] = {}
+    try:
+        import anyio
+        anyio.from_thread.run(save_config_to_db)
+    except Exception:
+        pass
+    return {"status": "ok", "cleared": n}
+
+# ----------------------------------------------------------------------------- #
 # CSV exports
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.get("/export/requirements.csv", response_class=PlainTextResponse)
 def export_requirements_csv(
     date: str = Query(..., description="dd-mm-yyyy"),
     language: Optional[str] = None,
     grp: Optional[str] = None,
+    service: Optional[str] = None,
 ):
-    rows = requirements(date=date, language=language, grp=grp)
+    rows = requirements(date=date, language=language, grp=grp, service=service)
     if not rows:
         return "date,interval_time,language,grp,service,volume,aht_sec,req_core,req_after_shrinkage\n"
     header = ["date","interval_time","language","grp","service","volume","aht_sec","req_core","req_after_shrinkage"]
@@ -776,9 +820,10 @@ def export_roster_csv(
     date: str = Query(..., description="dd-mm-yyyy"),
     language: Optional[str] = None,
     grp: Optional[str] = None,
+    service: Optional[str] = None,
 ):
-    day = generate_roster(RosterRequest(date=date, language=language, grp=grp))
-    header = ["date","agent_id","full_name","site_id","shift","breaks"]
+    day = generate_roster(RosterRequest(date=date, language=language, grp=grp, service=service))
+    header = ["date","agent_id","full_name","site_id","shift","service","breaks"]
     lines = [",".join(header)]
     for r in day.get("roster", []):
         breaks = json.dumps(r.get("breaks") or [])
@@ -788,13 +833,14 @@ def export_roster_csv(
             str(r.get("full_name","")),
             str(r.get("site_id","")),
             str(r.get("shift","")),
+            str(r.get("service","")),
             breaks.replace("\n",""),
         ]))
     return "\n".join(lines) + "\n"
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Playground — dd-mm-yyyy
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @app.get("/playground", response_class=HTMLResponse)
 def playground():
     html = f"""
@@ -811,6 +857,7 @@ def playground():
   <div><label>Date (dd-mm-yyyy)</label><input id="date" value="{datetime.utcnow().strftime('%d-%m-%Y')}"></div>
   <div><label>Language</label><input id="lang" value="EN"></div>
   <div><label>Group</label><input id="grp"  value="G1"></div>
+  <div><label>Service</label><input id="svc"  value=""></div>
   <div><label>Shrinkage</label><input id="shr" value="{CONFIG['shrinkage']}"></div>
 </div>
 <div class="row">
@@ -836,6 +883,7 @@ function vals() {{
     date: document.getElementById('date').value,
     language: document.getElementById('lang').value,
     grp: document.getElementById('grp').value,
+    service: document.getElementById('svc').value,
     shrinkage: parseFloat(document.getElementById('shr').value),
     target_sl: parseFloat(document.getElementById('tsl').value),
     target_t: parseInt(document.getElementById('tt').value,10),
@@ -844,10 +892,10 @@ function vals() {{
 function runReq() {{
   const v = vals();
   const q = new URLSearchParams({{ 
-    date: v.date, language: v.language, grp: v.grp, 
+    date: v.date, language: v.language, grp: v.grp, service: v.service,
     target_sl: v.target_sl, target_t: v.target_t, shrinkage: v.shrinkage 
   }});
-  fetch('/requirements?'+q).then(r=>r.json()).then(j=>out.textContent=JSON.stringify(j,null,2))
+  fetch('/requirements?'+q).then(async r=>{{ const t=await r.text(); try{{out.textContent=JSON.stringify(JSON.parse(t),null,2)}}catch(e){{out.textContent=t}} }})
     .catch(e=>out.textContent=String(e));
 }}
 function runRoster() {{
@@ -860,7 +908,7 @@ function runRange() {{
   const v = vals();
   const body = {{ date_from: document.getElementById('from').value,
                   date_to: document.getElementById('to').value,
-                  language: v.language, grp: v.grp, persist: true }};
+                  language: v.language, grp: v.grp, service: v.service, persist: true }};
   fetch('/generate-roster-range', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(body) }})
     .then(async r=>{{ const t=await r.text(); try{{out.textContent=JSON.stringify(JSON.parse(t),null,2)}}catch(e){{out.textContent=t}} }})
     .catch(e=>out.textContent=String(e));
