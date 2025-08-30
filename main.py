@@ -10,6 +10,37 @@ from datetime import datetime, timedelta
 from math import factorial, exp, ceil
 import os, httpx, json, logging, re
 
+# --- RBAC helpers -------------------------------------------------------------
+from functools import wraps
+from fastapi import Request
+
+ROLES = ("agent", "scheduler", "supervisor", "admin")
+
+def _role_from_headers(request: Request) -> str:
+    # Accept x-role from proxy/UI; default to "agent" if missing
+    r = request.headers.get("x-role") or request.headers.get("X-Role") or ""
+    r = r.strip().lower()
+    return r if r in ROLES else "agent"
+
+def _user_from_headers(request: Request) -> str:
+    return (request.headers.get("x-user") or request.headers.get("X-User") or "user").strip()
+
+def require_role(*allowed: str):
+    def deco(fn):
+        @wraps(fn)
+        async def _async_wrapper(*args, **kwargs):
+            request: Request = kwargs.get("request")
+            if not request:
+                # allow sync handlers that don't take request
+                raise HTTPException(500, "RBAC middleware needs Request")
+            role = _role_from_headers(request)
+            if allowed and role not in allowed:
+                raise HTTPException(403, f"Forbidden: requires roles {allowed}, but you are '{role}'")
+            return await fn(*args, **kwargs)
+        return _async_wrapper
+    return deco
+
+
 # ----------------------------------------------------------------------------- #
 # Logging
 # ----------------------------------------------------------------------------- #
@@ -939,6 +970,189 @@ def reset_ledger():
         pass
     return {"status":"ok","cleared_agents": n}
 
+# --- Config versioning (M17) --------------------------------------------------
+class ConfigVersionIn(BaseModel):
+    scope_level: Optional[str] = "global"  # global | site | service
+    scope_id: Optional[str] = None         # e.g., "QA" for site
+    notes: Optional[str] = None
+
+@app.get("/config/version/list")
+@require_role("scheduler", "supervisor", "admin")
+async def config_version_list(request: Request, limit: int = 50):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    rows = sb_get("wfm_config_versions", {
+        "select": "id,created_at,author,scope_level,scope_id,notes",
+        "order": "created_at.desc",
+        "limit": limit
+    })
+    return rows
+
+@app.post("/config/version/save")
+@require_role("scheduler", "supervisor", "admin")
+async def config_version_save(body: ConfigVersionIn, request: Request):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    author = _user_from_headers(request)
+    row = {
+        "author": author,
+        "scope_level": (body.scope_level or "global"),
+        "scope_id": body.scope_id,
+        "notes": body.notes or "",
+        "config": CONFIG
+    }
+    sb_post("wfm_config_versions", [row])
+    return {"status":"ok","saved":True}
+
+class ConfigRollbackIn(BaseModel):
+    id: str
+
+@app.post("/config/version/rollback")
+@require_role("admin")
+async def config_version_rollback(body: ConfigRollbackIn, request: Request):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    rows = sb_get("wfm_config_versions", {"select": "id,config", "id": f"eq.{body.id}", "limit": 1})
+    if not rows:
+        raise HTTPException(404, "version id not found")
+    version = rows[0]["config"] or {}
+    # Apply entirely
+    for k, v in version.items():
+        CONFIG[k] = v
+    try:
+        import anyio
+        anyio.from_thread.run(save_config_to_db)
+    except Exception:
+        pass
+    return {"status":"ok","rolled_back_to": body.id}
+# --- What-if simulate ---------------------------------------------------------
+class SimulateIn(BaseModel):
+    policy_text: str
+    date_from: Optional[str] = None  # dd-mm-yyyy
+    date_to: Optional[str] = None    # dd-mm-yyyy
+    language: Optional[str] = None
+    grp: Optional[str] = None
+    service: Optional[str] = None
+
+@app.post("/simulate")
+@require_role("scheduler", "supervisor", "admin")
+async def simulate(body: SimulateIn, request: Request):
+    # 1) parse policy to proposed CONFIG deltas (no apply)
+    parsed = parse_config(ParseConfigRequest(text=body.policy_text), apply=False)
+    proposed = parsed.get("proposed_changes") or {}
+
+    # 2) If dates provided, recompute requirements with a temporary overlay
+    def overlay(cfg: Dict[str, Any]):
+        snap = dict(CONFIG)  # shallow is fine (sub-dicts are read-only in this flow)
+        # merge rules carefully
+        for k, v in proposed.items():
+            if k == "rules":
+                cur = snap.setdefault("rules", {})
+                for rk, rv in v.items():
+                    if isinstance(rv, dict):
+                        cur.setdefault(rk, {})
+                        cur[rk].update(rv)
+                    else:
+                        cur[rk] = rv
+            else:
+                snap[k] = v
+        return snap
+
+    impact = None
+    if body.date_from and body.date_to:
+        iso_from = parse_ddmmyyyy(body.date_from); iso_to = parse_ddmmyyyy(body.date_to)
+        # quick roll-up: per day total req_with_buffers
+        cur = datetime.strptime(iso_from, "%Y-%m-%d")
+        end = datetime.strptime(iso_to, "%Y-%m-%d")
+        roll = []
+        while cur <= end:
+            date_dd = to_ddmmyyyy(cur.strftime("%Y-%m-%d"))
+            # temporarily run requirements using overlay
+            snap = overlay(CONFIG)
+            # monkey-patch globals just for this call
+            saved_rules = CONFIG.get("rules")
+            saved_target_sl = CONFIG.get("target_sl"); saved_target_t = CONFIG.get("target_t")
+            saved_shrinkage = CONFIG.get("shrinkage"); saved_interval = CONFIG.get("interval_seconds")
+            try:
+                CONFIG["rules"] = snap.get("rules", CONFIG.get("rules"))
+                CONFIG["target_sl"] = snap.get("target_sl", CONFIG.get("target_sl"))
+                CONFIG["target_t"] = snap.get("target_t", CONFIG.get("target_t"))
+                CONFIG["shrinkage"] = snap.get("shrinkage", CONFIG.get("shrinkage"))
+                CONFIG["interval_seconds"] = snap.get("interval_seconds", CONFIG.get("interval_seconds"))
+                reqs = requirements(date=date_dd, language=body.language, grp=body.grp, service=body.service)
+                total = sum(r["req_with_buffers"] for r in reqs)
+                roll.append({"date": date_dd, "total_req": total})
+            finally:
+                CONFIG["rules"] = saved_rules
+                CONFIG["target_sl"] = saved_target_sl; CONFIG["target_t"] = saved_target_t
+                CONFIG["shrinkage"] = saved_shrinkage; CONFIG["interval_seconds"] = saved_interval
+            cur += timedelta(days=1)
+        impact = {"req_totals": roll}
+
+    return {"proposed_changes": proposed, "impact": impact}
+
+# --- AI proxy (provider=ollama|openai) ---------------------------------------
+class AIIn(BaseModel):
+    prompt: str
+    provider: Optional[str] = "ollama"
+    model: Optional[str] = None  # defaults per provider
+
+@app.post("/ai/complete")
+def ai_complete(body: AIIn):
+    prov = (body.provider or "ollama").lower()
+    text = body.prompt or ""
+    if not text.strip():
+        raise HTTPException(400, "prompt is required")
+
+    # ENV config
+    OLLAMA_HOST = os.getenv("OLLAMA_HOST") or "http://localhost:11434"
+    OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+
+    try:
+        if prov == "ollama":
+            model = body.model or "llama3.1:8b-instruct-fp16"
+            url = f"{OLLAMA_HOST}/api/generate"
+            r = httpx.post(url, json={"model": model, "prompt": text, "stream": False}, timeout=60)
+            if r.status_code != 200:
+                return {"provider":"ollama","ok":False,"error":r.text}
+            out = r.json()
+            return {"provider":"ollama","ok":True,"model":model,"completion": out.get("response","")}
+        elif prov == "openai":
+            if not OPENAI_KEY:
+                return {"provider":"openai","ok":False,"error":"OPENAI_API_KEY not configured"}
+            model = body.model or "gpt-4o-mini"
+            # lightweight REST call (no SDK)
+            r = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                json={"model": model, "messages":[{"role":"user","content": text}], "temperature": 0.2},
+                timeout=60
+            )
+            if r.status_code != 200:
+                return {"provider":"openai","ok":False,"error":r.text}
+            data = r.json()
+            msg = (data.get("choices") or [{}])[0].get("message",{}).get("content","")
+            return {"provider":"openai","ok":True,"model":model,"completion": msg}
+        else:
+            return {"ok":False,"error":"unknown provider"}
+    except Exception as e:
+        return {"ok":False,"error": str(e)}
+
+@app.get("/swaps/audit")
+@require_role("supervisor", "admin")
+async def swaps_audit(date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 200, request: Request = None):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    params = {"select":"*","order":"decision_at.desc","limit": limit}
+    if date_from:
+        params["decision_at"] = f"gte.{parse_ddmmyyyy(date_from)}"
+    rows = sb_get("swaps_audit", params)
+    if date_to:
+        iso_to = parse_ddmmyyyy(date_to)
+        rows = [r for r in rows if (r.get("decision_at") or "")[:10] <= iso_to]
+    return rows
+
+
 # ----------------------------------------------------------------------------- #
 # NEW — M10: Explainability
 # ----------------------------------------------------------------------------- #
@@ -1503,6 +1717,26 @@ def _apply_swap_to_db(iso_date: str, a_from: str, a_to: str):
 
     # Persist as new rows (historical trail). If you want hard updates, add a PK and use upsert.
     sb_post("rosters", [new_from, new_to])
+# --- Swap audit helpers -------------------------------------------------------
+def _audit_swap(decision: str, req: Dict[str, Any], before_from: Dict[str, Any], before_to: Dict[str, Any],
+                after_from: Dict[str, Any], after_to: Dict[str, Any], approver: str, notes: Optional[Dict[str, Any]] = None):
+    try:
+        row = {
+            "swap_id": req.get("id"),
+            "date": req.get("date"),
+            "agent_from": req.get("agent_from"),
+            "agent_to": req.get("agent_to"),
+            "before_from_shift": (before_from or {}).get("shift"),
+            "before_to_shift": (before_to or {}).get("shift"),
+            "after_from_shift": (after_from or {}).get("shift"),
+            "after_to_shift": (after_to or {}).get("shift"),
+            "approver": approver,
+            "decision": decision,  # approved / denied
+            "notes": notes or {},
+        }
+        sb_post("swaps_audit", [row])
+    except Exception as e:
+        log.info(f"[swap audit] skipped: {e}")
 
 @app.get("/swap/list")
 def swap_list(
@@ -1557,11 +1791,15 @@ def swap_request(body: SwapRequestIn):
         applied = True
 
     return {"status": "ok", "created": True, "auto_applied": applied}
+from fastapi import Request
 
 @app.post("/swap/approve")
-def swap_approve(body: SwapDecisionIn):
+@require_role("scheduler", "supervisor", "admin")
+async def swap_approve(body: SwapDecisionIn, request: Request):
     if not REST_BASE:
         raise HTTPException(500, "Supabase env vars missing")
+    approver = _user_from_headers(request) or (body.approver or "approver")
+
     reqs = sb_get("swap_requests", {"select": "*", "id": f"eq.{body.id}", "limit": 1})
     if not reqs:
         raise HTTPException(404, "Swap request not found")
@@ -1570,32 +1808,45 @@ def swap_approve(body: SwapDecisionIn):
         raise HTTPException(400, f"Swap request is {req.get('status')}, not pending")
 
     iso = req["date"]; a_from = req["agent_from"]; a_to = req["agent_to"]
-    r_from = _get_roster_row(iso, a_from)
-    r_to   = _get_roster_row(iso, a_to)
-    if not r_from or not r_to:
+    r_from_before = _get_roster_row(iso, a_from)
+    r_to_before   = _get_roster_row(iso, a_to)
+    if not r_from_before or not r_to_before:
         raise HTTPException(400, "Both agents need an existing roster saved for this date.")
 
     ag_from = _load_agent(a_from) or {}
     ag_to   = _load_agent(a_to) or {}
-    ok_to, _ = _check_capability_for_swap(ag_to, r_from.get("meta") or {})
-    ok_from, _ = _check_capability_for_swap(ag_from, r_to.get("meta") or {})
+    ok_to, _ = _check_capability_for_swap(ag_to, r_from_before.get("meta") or {})
+    ok_from, _ = _check_capability_for_swap(ag_from, r_to_before.get("meta") or {})
     if not ok_to or not ok_from:
         raise HTTPException(400, "Capability check failed on approval.")
 
+    # Apply
     _apply_swap_to_db(iso, a_from, a_to)
 
+    # For "after" snapshot we read again (latest)
+    r_from_after = _get_roster_row(iso, a_from)
+    r_to_after   = _get_roster_row(iso, a_to)
+
+    # Update request
     update = dict(req)
     update["status"] = "approved"
-    update["decision_by"] = body.approver or "approver"
+    update["decision_by"] = approver
     update["decision_at"] = datetime.utcnow().isoformat()
     sb_upsert("swap_requests", [update], on_conflict="id")
 
+    # Audit log
+    _audit_swap("approved", req, r_from_before, r_to_before, r_from_after, r_to_after, approver, notes=(body.notes and {"notes": body.notes}))
+
     return {"status": "ok", "approved": True, "id": body.id}
 
+
 @app.post("/swap/deny")
-def swap_deny(body: SwapDecisionIn):
+@require_role("scheduler", "supervisor", "admin")
+async def swap_deny(body: SwapDecisionIn, request: Request):
     if not REST_BASE:
         raise HTTPException(500, "Supabase env vars missing")
+    approver = _user_from_headers(request) or (body.approver or "approver")
+
     reqs = sb_get("swap_requests", {"select": "*", "id": f"eq.{body.id}", "limit": 1})
     if not reqs:
         raise HTTPException(404, "Swap request not found")
@@ -1605,7 +1856,7 @@ def swap_deny(body: SwapDecisionIn):
 
     update = dict(req)
     update["status"] = "denied"
-    update["decision_by"] = body.approver or "approver"
+    update["decision_by"] = approver
     update["decision_at"] = datetime.utcnow().isoformat()
     if body.notes:
         m = dict(update.get("meta") or {})
@@ -1613,4 +1864,8 @@ def swap_deny(body: SwapDecisionIn):
         update["meta"] = m
     sb_upsert("swap_requests", [update], on_conflict="id")
 
+    # Audit log (no before/after diff because no change)
+    _audit_swap("denied", req, None, None, None, None, approver, notes=(body.notes and {"notes": body.notes}))
+
     return {"status": "ok", "denied": True, "id": body.id}
+
