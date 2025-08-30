@@ -1,4 +1,4 @@
-# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M7 roster-range read/export
+# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M8 availability
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +32,6 @@ else:
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     }
-    # Prefer service key for writes
     _write_token = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
     HEADERS_WRITE = {
         "apikey": _write_token,
@@ -46,7 +45,7 @@ app = FastAPI(title="CCC Scheduler API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten for prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,7 +55,6 @@ app.add_middleware(
 # Helpers — dates & time (UI uses dd-mm-yyyy; DB uses yyyy-mm-dd)
 # ----------------------------------------------------------------------------- #
 def parse_ddmmyyyy(d: str) -> str:
-    """Input dd-mm-yyyy -> output yyyy-mm-dd (ISO, for DB)."""
     try:
         return datetime.strptime(d, "%d-%m-%Y").strftime("%Y-%m-%d")
     except Exception:
@@ -66,7 +64,6 @@ def to_ddmmyyyy(iso: str) -> str:
     return datetime.strptime(iso, "%Y-%m-%d").strftime("%d-%m-%Y")
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    """Accept 'HH:MM' or 'HH:MM:SS' and return minutes from midnight."""
     s = str(hhmm)
     parts = s.split(":")
     if len(parts) < 2:
@@ -83,14 +80,12 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def ensure_list(x) -> List[Any]:
-    """Normalize Supabase text[]/json-ish fields to Python list."""
     if x is None:
         return []
     if isinstance(x, list):
         return x
     if isinstance(x, str):
         s = x.strip()
-        # JSON array?
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
             try:
                 v = json.loads(s)
@@ -98,7 +93,6 @@ def ensure_list(x) -> List[Any]:
                     return v
             except Exception:
                 pass
-        # Fallback comma-split
         parts = [p.strip().strip('"').strip("'") for p in s.split(",")]
         return [p for p in parts if p]
     return [x]
@@ -123,9 +117,9 @@ CONFIG_DEFAULT: Dict[str, Any] = {
 
     # constraints
     "site_hours_enforced": False,
-    "site_hours": {},                 # {"QA":{"open":"10:00","close":"19:00"}}
+    "site_hours": {},
     "rest_min_minutes": 12 * 60,
-    "prev_end_times": {},             # {"A001":"YYYY-MM-DDTHH:MM:SS"}
+    "prev_end_times": {},
 
     "timezone": "UTC",
 
@@ -134,6 +128,9 @@ CONFIG_DEFAULT: Dict[str, Any] = {
     "weight_secondary_language": 1.0,
     "weight_group_exact": 1.5,
     "weight_service_match": 1.0,
+
+    # NEW IN M8 — which states mean “do not schedule”
+    "off_states": ["OFF", "LEAVE", "SICK", "VACATION", "UNAVAILABLE"],
 }
 CONFIG: Dict[str, Any] = dict(CONFIG_DEFAULT)
 
@@ -234,14 +231,21 @@ def sb_get(table: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         raise HTTPException(r.status_code, r.text)
     return r.json()
 
-def sb_post(table: str, rows: List[Dict[str, Any]]) -> None:
+def sb_post(table: str, rows: List[Dict[str, Any]], params: Optional[Dict[str, Any]] = None) -> None:
     r = httpx.post(
         f"{REST_BASE}/{table}",
         headers={**HEADERS_WRITE, "Content-Type": "application/json"},
+        params=params or {},
         content=json.dumps(rows),
         timeout=30,
     )
     if r.status_code not in (200, 201):
+        raise HTTPException(r.status_code, r.text)
+
+# NEW IN M8 — simple delete helper (for idempotent off-setting)
+def sb_delete(table: str, params: Dict[str, Any]) -> None:
+    r = httpx.delete(f"{REST_BASE}/{table}", headers=HEADERS_WRITE, params=params, timeout=30)
+    if r.status_code not in (200, 204):
         raise HTTPException(r.status_code, r.text)
 
 # ----------------------------------------------------------------------------- #
@@ -355,7 +359,7 @@ def requirements(
 # Models
 # ----------------------------------------------------------------------------- #
 class RosterRequest(BaseModel):
-    date: str                    # dd-mm-yyyy
+    date: str
     language: Optional[str] = None
     grp: Optional[str] = None
     service: Optional[str] = None
@@ -365,19 +369,27 @@ class RosterRequest(BaseModel):
     target_t: Optional[int] = None
 
 class RangeRequest(BaseModel):
-    date_from: str               # dd-mm-yyyy
-    date_to: str                 # dd-mm-yyyy
+    date_from: str
+    date_to: str
     language: Optional[str] = None
     grp: Optional[str] = None
     service: Optional[str] = None
     persist: Optional[bool] = False
 
 class SaveRosterRequest(BaseModel):
-    date: str                    # dd-mm-yyyy
+    date: str
     roster: List[Dict[str, Any]]
 
+# NEW IN M8
+class AgentOffRequest(BaseModel):
+    agent_id: str
+    date_from: str
+    date_to: str
+    state: Optional[str] = "OFF"
+    notes: Optional[str] = None
+
 # ----------------------------------------------------------------------------- #
-# Scoring — pick best agents by skill/priority
+# Scoring
 # ----------------------------------------------------------------------------- #
 def agent_score(agent: Dict[str, Any], language: Optional[str], grp: Optional[str], service: Optional[str]) -> float:
     score = 0.0
@@ -431,28 +443,43 @@ def generate_roster(req: RosterRequest):
                 "grp": row["grp"], "svc": row["service"], "req": req_after
             })
 
-        # agents
+        # agents (all)
         sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
         agents = sb_get("agents", {"select": sel, "limit": 2000})
         for ag in agents:
             ag["trained_groups"] = ensure_list(ag.get("trained_groups"))
             ag["trained_services"] = ensure_list(ag.get("trained_services"))
 
-        # candidate pool (capability filter)
+        # NEW IN M8 — pull agent_state for the day and exclude OFF states
+        off_states = set(s.upper() for s in CONFIG.get("off_states", []))
+        try:
+            st_rows = sb_get("agent_state", {
+                "select": "agent_id,state",
+                "date": f"eq.{iso}",
+                "order": "agent_id.asc"
+            })
+            off_today = {r["agent_id"] for r in st_rows
+                         if str(r.get("state","")).upper() in off_states}
+        except Exception as e:
+            off_today = set()
+            log.info(f"[agent_state read skipped] {e}")
+
+        # candidate pool (capability filter + availability)
         if req.language or req.grp or req.service:
             pool = [
                 ag for ag in agents
-                if (not req.language or (ag.get("primary_language") == req.language or ag.get("secondary_language") == req.language))
+                if ag.get("agent_id") not in off_today
+                and (not req.language or (ag.get("primary_language") == req.language or ag.get("secondary_language") == req.language))
                 and (not req.grp or (req.grp in ag.get("trained_groups", [])))
                 and (not req.service or (req.service in ag.get("trained_services", []) or not ag.get("trained_services")))
             ]
         else:
-            pool = agents[:]
+            pool = [ag for ag in agents if ag.get("agent_id") not in off_today]
 
         # sort pool by score (desc)
         pool.sort(key=lambda ag: agent_score(ag, req.language, req.grp, req.service), reverse=True)
 
-        # demand grid (sum across services unless req.service was provided)
+        # demand grid
         times = sorted({hhmm_to_minutes(x["t"]) for x in intervals})
         times_map: Dict[int, List[Dict[str, Any]]] = {t: [iv for iv in intervals if hhmm_to_minutes(iv["t"]) == t] for t in times}
         demand = {t: sum(iv["req"] for iv in times_map[t]) for t in times}
@@ -507,7 +534,7 @@ def generate_roster(req: RosterRequest):
                     "agent_id": pick["agent_id"],
                     "full_name": pick["full_name"],
                     "site_id": pick.get("site_id"),
-                    "date": req.date,  # dd-mm-yyyy for output
+                    "date": req.date,
                     "shift": f"{minutes_to_hhmm(start_min)} - {minutes_to_hhmm(end_min % (24*60))}",
                     "service": req.service or "",
                     "notes": "auto assignment",
@@ -518,7 +545,7 @@ def generate_roster(req: RosterRequest):
                 if all(assigned[t] >= demand[t] for t in times):
                     break
 
-        # Break planning (safe if no intervals)
+        # Break planning (unchanged)
         try:
             time_list = sorted(times)
             if time_list:
@@ -685,7 +712,6 @@ def roster_range(req: RangeRequest):
         if req.persist and day.get("roster"):
             iso = cur.strftime("%Y-%m-%d")
             rows = []
-            # also update prev_end_times in CONFIG as we go
             for item in day["roster"]:
                 rows.append({
                     "date": iso,
@@ -696,7 +722,6 @@ def roster_range(req: RangeRequest):
                     "breaks": item.get("breaks") or [],
                     "meta": item,
                 })
-                # update prev_end_times (compute end ISO)
                 try:
                     sh = item.get("shift","")
                     st_str, en_str = [s.strip() for s in sh.split("-")]
@@ -714,7 +739,6 @@ def roster_range(req: RangeRequest):
                 sb_post("rosters", rows)
         cur += timedelta(days=1)
 
-    # persist updated CONFIG if we touched prev_end_times
     if req.persist:
         try:
             import anyio
@@ -725,7 +749,7 @@ def roster_range(req: RangeRequest):
     return out
 
 # ----------------------------------------------------------------------------- #
-# NEW IN M7 — read saved rosters over a range
+# NEW IN M8 — read saved rosters over a range
 # ----------------------------------------------------------------------------- #
 @app.get("/rosters")
 def read_rosters(
@@ -741,11 +765,9 @@ def read_rosters(
     params = {
         "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
         "date": f"gte.{iso_from}",
+        "and": f"(date.lte.{iso_to})",
         "order": "date.asc,agent_id.asc"
     }
-    # PostgREST range filter also needs upper bound
-    params["date"] = f"gte.{iso_from}"
-    params["and"] = f"(date.lte.{iso_to})"
     if agent_id:
         params["agent_id"] = f"eq.{agent_id}"
     if site_id:
@@ -828,6 +850,70 @@ def reset_prev_end():
     return {"status": "ok", "cleared": n}
 
 # ----------------------------------------------------------------------------- #
+# NEW IN M8 — agent availability APIs
+# ----------------------------------------------------------------------------- #
+@app.get("/agent-state")
+def get_agent_state(
+    date_from: str = Query(..., description="dd-mm-yyyy"),
+    date_to: str   = Query(..., description="dd-mm-yyyy"),
+    agent_id: Optional[str] = None,
+):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso_from = parse_ddmmyyyy(date_from)
+    iso_to   = parse_ddmmyyyy(date_to)
+    params = {
+        "select": "date,agent_id,state,notes",
+        "date": f"gte.{iso_from}",
+        "and": f"(date.lte.{iso_to})",
+        "order": "date.asc,agent_id.asc"
+    }
+    if agent_id:
+        params["agent_id"] = f"eq.{agent_id}"
+    rows = sb_get("agent_state", params)
+    for r in rows:
+        r["date"] = to_ddmmyyyy(r["date"])
+    return rows
+
+@app.post("/agent-off")
+def set_agent_off(body: AgentOffRequest):
+    """
+    Mark an agent OFF/LEAVE/etc. for a date range.
+    Idempotent: deletes existing rows for that (agent, date) window, then inserts fresh ones.
+    """
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso_from = parse_ddmmyyyy(body.date_from)
+    iso_to   = parse_ddmmyyyy(body.date_to)
+    st = datetime.strptime(iso_from, "%Y-%m-%d")
+    en = datetime.strptime(iso_to, "%Y-%m-%d")
+    if en < st:
+        raise HTTPException(400, "date_to before date_from")
+
+    # delete existing records for that window (if any)
+    sb_delete("agent_state", {
+        "agent_id": f"eq.{body.agent_id}",
+        "date": f"gte.{iso_from}",
+        "and": f"(date.lte.{iso_to})"
+    })
+
+    # insert new rows, one per day
+    rows = []
+    cur = st
+    while cur <= en:
+        rows.append({
+            "date": cur.strftime("%Y-%m-%d"),
+            "agent_id": body.agent_id,
+            "state": body.state,
+            "notes": body.notes or ""
+        })
+        cur += timedelta(days=1)
+    if rows:
+        # allow upsert if unique constraint exists
+        sb_post("agent_state", rows, params={"on_conflict": "date,agent_id"})
+    return {"status": "ok", "inserted": len(rows), "agent_id": body.agent_id, "state": body.state}
+
+# ----------------------------------------------------------------------------- #
 # CSV exports
 # ----------------------------------------------------------------------------- #
 @app.get("/export/requirements.csv", response_class=PlainTextResponse)
@@ -869,7 +955,6 @@ def export_roster_csv(
         ]))
     return "\n".join(lines) + "\n"
 
-# NEW IN M7 — CSV export of saved rosters over a range
 @app.get("/export/rosters-range.csv", response_class=PlainTextResponse)
 def export_rosters_range_csv(
     date_from: str = Query(..., description="dd-mm-yyyy"),
@@ -900,7 +985,7 @@ def export_rosters_range_csv(
     return "\n".join(lines) + "\n"
 
 # ----------------------------------------------------------------------------- #
-# Playground — dd-mm-yyyy
+# Playground — dd-mm-yyyy (unchanged UI for now)
 # ----------------------------------------------------------------------------- #
 @app.get("/playground", response_class=HTMLResponse)
 def playground():
