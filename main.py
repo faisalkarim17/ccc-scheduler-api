@@ -1244,6 +1244,184 @@ function runRange() {{
 </body></html>
 """
     return HTMLResponse(html)
+# --- M12: My Week -------------------------------------------------------------
+
+@app.get("/me/week")
+def my_week(
+    agent_id: str = Query(...),
+    date_from: str = Query(..., description="dd-mm-yyyy"),
+    date_to: str = Query(..., description="dd-mm-yyyy"),
+):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso_from = parse_ddmmyyyy(date_from)
+    iso_to   = parse_ddmmyyyy(date_to)
+    rows = sb_get("rosters", {
+        "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
+        "agent_id": f"eq.{agent_id}",
+        "date": f"gte.{iso_from}",
+        "order": "date.asc"
+    })
+    # collapse to latest per day (client-side)
+    by_day = {}
+    for r in rows:
+        if r["date"] <= iso_to:
+            by_day[r["date"]] = r  # last one wins due to order
+    out = []
+    for iso, r in sorted(by_day.items()):
+        r["date"] = to_ddmmyyyy(r["date"])
+        out.append(r)
+    return {"agent_id": agent_id, "from": date_from, "to": date_to, "days": out}
+
+
+# --- M12: AI swap suggestions --------------------------------------------------
+
+class SwapSuggestIn(BaseModel):
+    date: str            # dd-mm-yyyy
+    agent_id: str
+    k: Optional[int] = 5
+
+@app.post("/suggest/swaps")
+def suggest_swaps(body: SwapSuggestIn):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    iso = parse_ddmmyyyy(body.date)
+
+    # the agent's roster for that day (must exist)
+    me = _get_roster_row(iso, body.agent_id)
+    if not me:
+        raise HTTPException(404, "No saved roster for this agent on that date.")
+    me_start = hhmm_to_minutes(me["shift"].split("-")[0].strip())
+    # infer target daypart using configured dayparts
+    dp_bounds = get_daypart_bounds(CONFIG.get("rules", {}).get("dayparts", {}))
+    me_dp = infer_daypart(me_start, dp_bounds) if dp_bounds else "morning"
+
+    # fetch all rostered that day
+    all_rows = sb_get("rosters", {
+        "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
+        "date": f"eq.{iso}",
+        "order": "agent_id.asc"
+    })
+    # collapse to latest per (date, agent_id)
+    seen = set()
+    rostered = []
+    for r in all_rows:
+        key = (r["date"], r["agent_id"])
+        if key in seen: 
+            continue
+        seen.add(key)
+        rostered.append(r)
+
+    # load agents master
+    sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
+    agents = {a["agent_id"]: a for a in sb_get("agents", {"select": sel, "limit": 2000})}
+    for a in agents.values():
+        a["trained_groups"] = ensure_list(a.get("trained_groups"))
+        a["trained_services"] = ensure_list(a.get("trained_services"))
+
+    # the filters used to assign me (if any exist in meta)
+    lang = (me.get("meta") or {}).get("service_language") or (me.get("meta") or {}).get("language")
+    grp  = (me.get("meta") or {}).get("grp")
+    svc  = (me.get("meta") or {}).get("service")
+
+    # build candidate list = everyone else rostered same day
+    candidates = [r for r in rostered if r.get("agent_id") != body.agent_id]
+
+    def can_cover(agent_id: str, target_row: Dict[str, Any]) -> bool:
+        ag = agents.get(agent_id)
+        if not ag: 
+            return False
+        svc_need = (target_row.get("meta") or {}).get("service")
+        if svc_need:
+            trained = ensure_list(ag.get("trained_services"))
+            if trained and svc_need not in trained:
+                return False
+        # optional: language/group checks using target_row.meta
+        lang_need = (target_row.get("meta") or {}).get("language")
+        if lang_need and not (ag.get("primary_language")==lang_need or ag.get("secondary_language")==lang_need):
+            return False
+        grp_need = (target_row.get("meta") or {}).get("grp")
+        if grp_need and grp_need not in ensure_list(ag.get("trained_groups")):
+            return False
+        return True
+
+    # score: how "fair" + skill aligned a swap would be for both directions
+    iso_day = iso
+    ideas = []
+    for other in candidates:
+        other_id = other["agent_id"]
+        if not (can_cover(other_id, me) and can_cover(body.agent_id, other)):
+            continue
+
+        # eligibility checks similar to /explain-assignment fairness
+        # compute delta fairness: if me takes other's start, and other takes mine
+        other_start = hhmm_to_minutes(other["shift"].split("-")[0].strip())
+        other_dp = infer_daypart(other_start, dp_bounds) if dp_bounds else "morning"
+
+        # simple “benefit” heuristic: prefer swaps that reduce repeated dayparts in last 7d
+        me_rep   = _ledger_count_in_window(body.agent_id, me_dp, iso_day, 7)
+        other_rep= _ledger_count_in_window(other_id, other_dp, iso_day, 7)
+
+        # pretend post-swap: me gets other_dp, other gets me_dp
+        me_post_rep    = _ledger_count_in_window(body.agent_id, other_dp, iso_day, 7)
+        other_post_rep = _ledger_count_in_window(other_id, me_dp, iso_day, 7)
+
+        benefit = 0.0
+        if me_rep >= 2 and other_dp != me_dp: benefit += 1.0
+        if other_rep >= 2 and me_dp != other_dp: benefit += 1.0
+
+        # skill alignment via your agent_score for each direction
+        me_ag   = agents.get(body.agent_id, {})
+        other_ag= agents.get(other_id, {})
+        s1,_ = agent_score(me_ag, lang, grp, svc, other_dp, iso_day)
+        s2,_ = agent_score(other_ag, lang, grp, svc, me_dp, iso_day)  # coarse reuse
+
+        total_score = benefit + 0.25*(s1 + s2)
+
+        ideas.append({
+            "swap_with": other_id,
+            "swap_with_name": other.get("full_name"),
+            "their_shift": other.get("shift"),
+            "your_shift": me.get("shift"),
+            "benefit_hint": {"you_relief": me_rep, "them_relief": other_rep},
+            "score": round(total_score, 3)
+        })
+
+    ideas.sort(key=lambda x: x["score"], reverse=True)
+    return {"date": body.date, "agent_id": body.agent_id, "suggestions": ideas[:max(1, body.k or 5)]}
+
+
+# --- M12: Preferences (optional, simple) --------------------------------------
+
+class PrefsIn(BaseModel):
+    agent_id: str
+    prefer_dayparts: Optional[List[str]] = None
+    avoid_dayparts: Optional[List[str]] = None
+    blackout_dates: Optional[List[str]] = None  # dd-mm-yyyy
+
+@app.get("/prefs")
+def prefs_get(agent_id: str = Query(...)):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    rows = sb_get("agent_prefs", {"select": "*", "agent_id": f"eq.{agent_id}", "limit": 1})
+    return rows[0] if rows else {"agent_id": agent_id, "prefer_dayparts": [], "avoid_dayparts": [], "blackout_dates": []}
+
+@app.post("/prefs")
+def prefs_set(body: PrefsIn):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+    blk = []
+    for d in (body.blackout_dates or []):
+        blk.append(parse_ddmmyyyy(d))
+    row = {
+        "agent_id": body.agent_id,
+        "prefer_dayparts": body.prefer_dayparts or [],
+        "avoid_dayparts": body.avoid_dayparts or [],
+        "blackout_dates": blk,
+        "updated_at": datetime.utcnow().isoformat()
+    }
+    sb_upsert("agent_prefs", [row], on_conflict="agent_id")
+    return {"status": "ok"}
 
 # ----------------------------------------------------------------------------- #
 # NEW — Convenience: read persisted rosters by date range (for verification)
