@@ -67,8 +67,18 @@ def to_ddmmyyyy(iso: str) -> str:
     return datetime.strptime(iso, "%Y-%m-%d").strftime("%d-%m-%Y")
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    hh, mm = hhmm.split(":")
-    return int(hh) * 60 + int(mm)
+    """
+    Accept 'HH:MM' or 'HH:MM:SS' (or anything starting with HH:MM...).
+    Returns minutes from midnight.
+    """
+    s = str(hhmm)
+    parts = s.split(":")
+    if len(parts) < 2:
+        raise ValueError(f"Bad time string '{hhmm}'")
+    hh = int(parts[0])
+    mm = int(parts[1])
+    return hh * 60 + mm
+
 
 def minutes_to_hhmm(m: int) -> str:
     hh = (m // 60) % 24
