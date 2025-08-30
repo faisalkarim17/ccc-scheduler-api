@@ -1,4 +1,4 @@
-# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M9 rules+fairness
+# main.py — CCC Scheduler API (Supabase-backed, dd-mm-yyyy I/O) — M10 explainability + free-text config
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from math import factorial, exp, ceil
-import os, httpx, json, logging
+import os, httpx, json, logging, re
 
 # ----------------------------------------------------------------------------- #
 # Logging
@@ -104,22 +104,15 @@ def ensure_list(x) -> List[Any]:
     return [x]
 
 def is_weekend(iso_date: str) -> bool:
-    # Monday=0 … Sunday=6
     dt = datetime.strptime(iso_date, "%Y-%m-%d")
     return dt.weekday() >= 5
 
 def time_in_range(start_min: int, end_min: int, t: int) -> bool:
-    """True if t within [start,end) supporting wrap over midnight."""
     if start_min <= end_min:
         return start_min <= t < end_min
-    # wraps
     return t >= start_min or t < end_min
 
 def get_daypart_bounds(conf_dayparts: Dict[str, List[str]]) -> Dict[str, Tuple[int, int]]:
-    """
-    Convert {"morning":["06:00","14:00"], "evening":["14:00","22:00"], "night":["22:00","06:00"]}
-    into minutes ranges.
-    """
     out = {}
     for k, pair in conf_dayparts.items():
         st = hhmm_to_minutes(pair[0]); en = hhmm_to_minutes(pair[1])
@@ -130,13 +123,12 @@ def infer_daypart(mins: int, bounds: Dict[str, Tuple[int,int]]) -> str:
     for name, (st, en) in bounds.items():
         if time_in_range(st, en, mins):
             return name
-    # fallback buckets if misconfigured
     if 6*60 <= mins < 14*60: return "morning"
     if 14*60 <= mins < 22*60: return "evening"
     return "night"
 
 # ----------------------------------------------------------------------------- #
-# CONFIG — default (merged at startup from DB row id=1 in public.wfm_config)
+# CONFIG — default (merged from DB at startup)
 # ----------------------------------------------------------------------------- #
 CONFIG_DEFAULT: Dict[str, Any] = {
     # requirements
@@ -157,39 +149,38 @@ CONFIG_DEFAULT: Dict[str, Any] = {
     "site_hours_enforced": False,
     "site_hours": {},                 # {"QA":{"open":"10:00","close":"19:00"}}
     "rest_min_minutes": 12 * 60,
-    "prev_end_times": {},             # {"A001":"YYYY-MM-DDTHH:MM:SS"}
+    "prev_end_times": {},
 
     "timezone": "UTC",
 
-    # scoring knobs (skills/services)
+    # scoring
     "weight_primary_language": 2.0,
     "weight_secondary_language": 1.0,
     "weight_group_exact": 1.5,
     "weight_service_match": 1.0,
 
-    # NEW: rules (buffers + fairness + hard caps)
+    # rules (buffers + fairness + hard caps)
     "rules": {
         "buffers": {
-            "weekday_pct": 0.05,   # +5% buffer on weekdays
-            "weekend_pct": 0.10,   # +10% buffer on Sat/Sun
-            "night_pct": 0.10      # extra +10% for night daypart
+            "weekday_pct": 0.05,
+            "weekend_pct": 0.10,
+            "night_pct": 0.10
         },
-        "dayparts": {              # define daypart windows
+        "dayparts": {
             "morning": ["06:00", "14:00"],
             "evening": ["14:00", "22:00"],
             "night":   ["22:00", "06:00"]
         },
         "hard": {
-            "max_nights_per_7d": 2  # per-agent hard cap
+            "max_nights_per_7d": 2
         },
         "soft": {
             "balance_dayparts": True,
-            "weight_balance": 1.0    # adds/subtracts in agent score
+            "weight_balance": 1.0
         }
     },
 
-    # NEW: fairness ledger — updated when persistence is requested
-    # {"A001": {"night": ["2025-08-27","2025-08-29"], "morning":[...], "evening":[...]}}
+    # fairness ledger
     "fairness_ledger": {}
 }
 CONFIG: Dict[str, Any] = dict(CONFIG_DEFAULT)
@@ -252,7 +243,7 @@ def health_db():
         raise HTTPException(500, f"Supabase REST error: {e}")
 
 # ----------------------------------------------------------------------------- #
-# Erlang C & requirements math
+# Erlang C & requirements
 # ----------------------------------------------------------------------------- #
 def erlang_c(a: float, N: int) -> float:
     if N <= a:
@@ -363,9 +354,7 @@ def _buffer_multiplier(iso_date: str, interval_hhmm: str) -> float:
     dayparts = rules.get("dayparts", {})
     bounds = get_daypart_bounds(dayparts) if dayparts else {}
     base = 1.0
-    # weekday/weekend
     base += buffers.get("weekend_pct", 0.0) if is_weekend(iso_date) else buffers.get("weekday_pct", 0.0)
-    # night extra
     if bounds:
         iv_min = hhmm_to_minutes(interval_hhmm)
         dp = infer_daypart(iv_min, bounds)
@@ -410,9 +399,7 @@ def requirements(
     for row in rows:
         vol = int(row["volume"]); aht = int(row["aht_sec"])
         N_core = required_agents_for_target(vol, aht, interval_seconds, target_sl, target_t)
-        # shrinkage to FTE
         req_after = N_core if shrinkage >= 0.999 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
-        # apply buffer multipliers
         mult = _buffer_multiplier(iso, str(row["interval_time"]))
         req_buf = int(ceil(req_after * mult))
         out.append({
@@ -433,7 +420,7 @@ def requirements(
 # Models
 # ----------------------------------------------------------------------------- #
 class RosterRequest(BaseModel):
-    date: str                    # dd-mm-yyyy
+    date: str
     language: Optional[str] = None
     grp: Optional[str] = None
     service: Optional[str] = None
@@ -443,22 +430,31 @@ class RosterRequest(BaseModel):
     target_t: Optional[int] = None
 
 class RangeRequest(BaseModel):
-    date_from: str               # dd-mm-yyyy
-    date_to: str                 # dd-mm-yyyy
+    date_from: str
+    date_to: str
     language: Optional[str] = None
     grp: Optional[str] = None
     service: Optional[str] = None
     persist: Optional[bool] = False
 
 class SaveRosterRequest(BaseModel):
-    date: str                    # dd-mm-yyyy
+    date: str
     roster: List[Dict[str, Any]]
+
+class ExplainRequest(BaseModel):
+    date: str
+    language: Optional[str] = None
+    grp: Optional[str] = None
+    service: Optional[str] = None
+    agent_id: Optional[str] = None
+
+class ParseConfigRequest(BaseModel):
+    text: str
 
 # ----------------------------------------------------------------------------- #
 # Fairness helpers (last 7 days)
 # ----------------------------------------------------------------------------- #
 def _ledger_prune_older_than(days: int = 30):
-    """Keep ledger tidy (best-effort; persisted via /admin/config/save path)."""
     led = CONFIG.get("fairness_ledger", {})
     cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     for aid, buckets in list(led.items()):
@@ -492,89 +488,79 @@ def agent_score(agent: Dict[str, Any],
                 grp: Optional[str],
                 service: Optional[str],
                 target_daypart: Optional[str],
-                iso_date: str) -> float:
+                iso_date: str) -> Tuple[float, Dict[str, float]]:
     score = 0.0
-    # skills/services
-    if language:
-        if agent.get("primary_language") == language:
-            score += CONFIG.get("weight_primary_language", 2.0)
-        if agent.get("secondary_language") == language:
-            score += CONFIG.get("weight_secondary_language", 1.0)
+    breakdown = {}
+    if language and agent.get("primary_language") == language:
+        w = CONFIG.get("weight_primary_language", 2.0); score += w; breakdown["primary_language"] = w
+    if language and agent.get("secondary_language") == language:
+        w = CONFIG.get("weight_secondary_language", 1.0); score += w; breakdown["secondary_language"] = w
     if grp and (grp in ensure_list(agent.get("trained_groups"))):
-        score += CONFIG.get("weight_group_exact", 1.5)
+        w = CONFIG.get("weight_group_exact", 1.5); score += w; breakdown["group_match"] = w
     if service and (service in ensure_list(agent.get("trained_services"))):
-        score += CONFIG.get("weight_service_match", 1.0)
+        w = CONFIG.get("weight_service_match", 1.0); score += w; breakdown["service_match"] = w
 
-    # fairness soft-rule (daypart balance)
     rules = CONFIG.get("rules", {})
     soft = rules.get("soft", {})
     if soft.get("balance_dayparts") and target_daypart:
         w = float(soft.get("weight_balance", 1.0))
-        # lower count in window => higher score (encourage balance)
         had = _ledger_count_in_window(agent["agent_id"], target_daypart, iso_date, window_days=7)
-        # 0 -> +w, 1 -> +0.5w, 2 -> 0, >=3 -> -w (gently push away)
-        if had == 0:
-            score += 1.0 * w
-        elif had == 1:
-            score += 0.5 * w
-        elif had == 2:
-            score += 0.0
-        else:
-            score -= 1.0 * w
-
-    return score
+        adj = 0.0
+        if had == 0: adj = +1.0 * w
+        elif had == 1: adj = +0.5 * w
+        elif had >= 3: adj = -1.0 * w
+        score += adj
+        breakdown["fairness_balance"] = adj
+    return score, breakdown
 
 # ----------------------------------------------------------------------------- #
-# Generate roster (single day) — with buffers + fairness + night cap
+# Generate roster (single day) — M9 logic (unchanged)
 # ----------------------------------------------------------------------------- #
+def _generate_intervals(iso: str, req: RosterRequest,
+                        interval_seconds: int, target_sl: float, target_t: int, shrinkage: float):
+    f_params = {
+        "select": "date,interval_time,language,grp,service,volume,aht_sec",
+        "date": f"eq.{iso}",
+        "order": "interval_time.asc,language.asc,grp.asc,service.asc",
+        **({"language": f"eq.{req.language}"} if req.language else {}),
+        **({"grp": f"eq.{req.grp}"} if req.grp else {}),
+        **({"service": f"eq.{req.service}"} if req.service else {}),
+    }
+    fc_rows = sb_get("forecasts", f_params)
+    intervals = []
+    for row in fc_rows:
+        vol = int(row["volume"]); aht = int(row["aht_sec"])
+        N_core = required_agents_for_target(vol, aht, interval_seconds, target_sl, target_t)
+        req_after = N_core if shrinkage >= 0.999 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
+        mult = _buffer_multiplier(iso, str(row["interval_time"]))
+        req_buf = int(ceil(req_after * mult))
+        intervals.append({
+            "t": row["interval_time"], "lang": row["language"],
+            "grp": row["grp"], "svc": row["service"], "req": req_buf
+        })
+    return intervals
+
 @app.post("/generate-roster")
 def generate_roster(req: RosterRequest):
     try:
         if not REST_BASE:
             raise HTTPException(500, "Supabase env vars missing")
-
         interval_seconds = req.interval_seconds or CONFIG["interval_seconds"]
         target_sl = req.target_sl if req.target_sl is not None else CONFIG["target_sl"]
         target_t = req.target_t if req.target_t is not None else CONFIG["target_t"]
         shrinkage = req.shrinkage if req.shrinkage is not None else CONFIG["shrinkage"]
-
         iso = parse_ddmmyyyy(req.date)
         rules = CONFIG.get("rules", {})
         dayparts_conf = rules.get("dayparts", {})
         dp_bounds = get_daypart_bounds(dayparts_conf) if dayparts_conf else {}
+        intervals = _generate_intervals(iso, req, interval_seconds, target_sl, target_t, shrinkage)
 
-        # forecasts -> intervals
-        f_params = {
-            "select": "date,interval_time,language,grp,service,volume,aht_sec",
-            "date": f"eq.{iso}",
-            "order": "interval_time.asc,language.asc,grp.asc,service.asc",
-            **({"language": f"eq.{req.language}"} if req.language else {}),
-            **({"grp": f"eq.{req.grp}"} if req.grp else {}),
-            **({"service": f"eq.{req.service}"} if req.service else {}),
-        }
-        fc_rows = sb_get("forecasts", f_params)
-
-        intervals = []
-        for row in fc_rows:
-            vol = int(row["volume"]); aht = int(row["aht_sec"])
-            N_core = required_agents_for_target(vol, aht, interval_seconds, target_sl, target_t)
-            req_after = N_core if shrinkage >= 0.999 else ceil(N_core / (1.0 - max(0.0, min(shrinkage, 0.95))))
-            # apply buffers
-            mult = _buffer_multiplier(iso, str(row["interval_time"]))
-            req_buf = int(ceil(req_after * mult))
-            intervals.append({
-                "t": row["interval_time"], "lang": row["language"],
-                "grp": row["grp"], "svc": row["service"], "req": req_buf
-            })
-
-        # agents
         sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
         agents = sb_get("agents", {"select": sel, "limit": 2000})
         for ag in agents:
             ag["trained_groups"] = ensure_list(ag.get("trained_groups"))
             ag["trained_services"] = ensure_list(ag.get("trained_services"))
 
-        # candidate pool (capability filter)
         if req.language or req.grp or req.service:
             pool = [
                 ag for ag in agents
@@ -585,7 +571,6 @@ def generate_roster(req: RosterRequest):
         else:
             pool = agents[:]
 
-        # demand grid (sum across services unless req.service was provided)
         times = sorted({hhmm_to_minutes(x["t"]) for x in intervals})
         times_map: Dict[int, List[Dict[str, Any]]] = {t: [iv for iv in intervals if hhmm_to_minutes(iv["t"]) == t] for t in times}
         demand = {t: sum(iv["req"] for iv in times_map[t]) for t in times}
@@ -601,41 +586,30 @@ def generate_roster(req: RosterRequest):
 
         candidate_starts = sorted({t for t in times}, key=lambda s: -shift_gain(s))
 
-        # Determine daypart of each candidate shift start
-        def start_daypart(start_min: int) -> str:
-            if not dp_bounds:
-                # fallback buckets
-                return infer_daypart(start_min, get_daypart_bounds(CONFIG["rules"]["dayparts"]))
-            return infer_daypart(start_min, dp_bounds)
-
-        # hard rule helpers
         hard = rules.get("hard", {})
         max_nights_7d = int(hard.get("max_nights_per_7d", 2))
+
+        def start_dp(start_min: int) -> str:
+            return infer_daypart(start_min, dp_bounds or get_daypart_bounds(CONFIG["rules"]["dayparts"]))
 
         for start in candidate_starts:
             start_min = start
             end_min = start_min + SHIFT_MIN
-            target_dp = start_daypart(start_min)
-
+            target_dp = start_dp(start_min)
             while any(start_min <= t < end_min and assigned[t] < demand[t] for t in times):
-                # sort remaining pool by combined score (skills + fairness soft-rule)
                 ranked = sorted(
                     [ag for ag in pool if ag["agent_id"] not in used],
-                    key=lambda ag: agent_score(ag, req.language, req.grp, req.service, target_dp, iso),
+                    key=lambda ag: agent_score(ag, req.language, req.grp, req.service, target_dp, iso)[0],
                     reverse=True
                 )
-
                 pick = None
                 for ag in ranked:
-                    # site hours rule (optional)
                     if CONFIG["site_hours_enforced"]:
-                        site = ag.get("site_id")
-                        sh = CONFIG["site_hours"].get(site) if site else None
+                        site = ag.get("site_id"); sh = CONFIG["site_hours"].get(site) if site else None
                         if sh and sh.get("open") and sh.get("close"):
                             o = hhmm_to_minutes(sh["open"]); c = hhmm_to_minutes(sh["close"])
                             if not (o <= start_min and end_min <= c):
                                 continue
-                    # cross-day rest (already in config)
                     prev_end = CONFIG["prev_end_times"].get(ag["agent_id"])
                     if prev_end:
                         try:
@@ -645,24 +619,19 @@ def generate_roster(req: RosterRequest):
                                 continue
                         except Exception:
                             pass
-                    # hard: max nights per 7d
                     if target_dp == "night":
                         night_ct = _ledger_count_in_window(ag["agent_id"], "night", iso, window_days=7)
                         if night_ct >= max_nights_7d:
                             continue
-
-                    pick = ag
-                    break
-
+                    pick = ag; break
                 if not pick:
                     break
-
                 used.add(pick["agent_id"])
                 roster.append({
                     "agent_id": pick["agent_id"],
                     "full_name": pick["full_name"],
                     "site_id": pick.get("site_id"),
-                    "date": req.date,  # dd-mm-yyyy for output
+                    "date": req.date,
                     "shift": f"{minutes_to_hhmm(start_min)} - {minutes_to_hhmm(end_min % (24*60))}",
                     "service": req.service or "",
                     "daypart": target_dp,
@@ -674,34 +643,29 @@ def generate_roster(req: RosterRequest):
                 if all(assigned[t] >= demand[t] for t in times):
                     break
 
-        # Break planning (safe if no intervals)
+        # Break planning (unchanged)
         try:
             time_list = sorted(times)
             if time_list:
                 def snap_to_grid(m): return min(time_list, key=lambda t: abs(t - m))
                 BREAK_CAP_FRAC = CONFIG["break_cap_frac"]
                 break_load = {t: 0 for t in time_list}
-
                 def cap_at(t):
                     base = assigned[t]
                     if base <= 0: return 0
                     return max(1, int(ceil(base * BREAK_CAP_FRAC)))
-
                 def span_ok(s, dur):
                     e = s + dur
                     for t in time_list:
                         if s <= t < e and (break_load[t] + 1 > cap_at(t)):
                             return False
                     return True
-
                 def stress(s, dur):
-                    e = s + dur
-                    sc = 0
+                    e = s + dur; sc = 0
                     for t in time_list:
                         if s <= t < e:
                             sc += max(demand[t] - assigned[t], 0)
                     return sc
-
                 def choose_slot(cands, dur):
                     best = None; best_sc = None
                     for s in cands:
@@ -709,8 +673,7 @@ def generate_roster(req: RosterRequest):
                             sc = stress(s, dur)
                             if best_sc is None or sc < best_sc:
                                 best_sc = sc; best = s
-                    if best is not None:
-                        return best
+                    if best is not None: return best
                     best = None; best_pen = None; best_sc = None
                     for s in cands:
                         e = s + dur; pen = 0; sc = 0
@@ -723,63 +686,48 @@ def generate_roster(req: RosterRequest):
                            (pen == best_pen and (best_sc is None or sc < best_sc))):
                             best_pen = pen; best_sc = sc; best = s
                     return best
-
                 def window_candidates(center, dur, lo, hi):
                     w_lo = clamp(center - 60, lo, max(lo, hi - dur))
                     w_hi = clamp(center + 60, lo, max(lo, hi - dur))
                     cands = [t for t in time_list if w_lo <= t <= w_hi]
                     return cands or [snap_to_grid(center)]
-
                 for item in roster:
                     st_str, en_str = [s.strip() for s in item["shift"].split("-")]
                     st_h, st_m = map(int, st_str.split(":"))
                     en_h, en_m = map(int, en_str.split(":"))
                     start_min = st_h * 60 + st_m
                     end_min   = en_h * 60 + en_m
-                    if end_min <= start_min:
-                        end_min += 24 * 60
-
+                    if end_min <= start_min: end_min += 24 * 60
                     NO_HEAD, NO_TAIL, GAP = CONFIG["no_head"], CONFIG["no_tail"], CONFIG["lunch_gap"]
                     place_start = start_min + NO_HEAD
                     place_end   = end_min   - NO_TAIL
                     pattern = CONFIG["break_pattern"]
                     if place_end - place_start < (sum(pattern) + 2 * GAP):
-                        item["breaks"] = []
-                        continue
-
+                        item["breaks"] = []; continue
                     mid = (start_min + end_min) // 2
                     lunch_target = clamp(mid, place_start + GAP // 2, place_end - GAP // 2)
-
                     lunch_dur = max(10, int(pattern[1]))
                     lunch_cands = window_candidates(lunch_target, lunch_dur, place_start, place_end)
                     lunch_s = choose_slot(lunch_cands, lunch_dur) or lunch_cands[0]
                     lunch_e = lunch_s + lunch_dur
                     for t in time_list:
-                        if lunch_s <= t < lunch_e:
-                            break_load[t] += 1
-
-                    b1_dur = max(5, int(pattern[0]))
-                    b1_end_allowed = lunch_s - GAP
+                        if lunch_s <= t < lunch_e: break_load[t] += 1
+                    b1_dur = max(5, int(pattern[0])); b1_end_allowed = lunch_s - GAP
                     b1_cands = [t for t in window_candidates(lunch_s - GAP - 45, b1_dur, place_start, place_end)
                                 if (t + b1_dur) <= b1_end_allowed]
                     b1_s = b1_cands and choose_slot(b1_cands, b1_dur)
                     b1_e = (b1_s + b1_dur) if b1_s else None
                     if b1_s:
                         for t in time_list:
-                            if b1_s <= t < b1_e:
-                                break_load[t] += 1
-
-                    b3_dur = max(5, int(pattern[2]))
-                    b3_start_allowed = lunch_e + GAP
+                            if b1_s <= t < b1_e: break_load[t] += 1
+                    b3_dur = max(5, int(pattern[2])); b3_start_allowed = lunch_e + GAP
                     b3_cands = [t for t in window_candidates(lunch_s + GAP + 45, b3_dur, place_start, place_end)
                                 if t >= b3_start_allowed]
                     b3_s = b3_cands and choose_slot(b3_cands, b3_dur)
                     b3_e = (b3_s + b3_dur) if b3_s else None
                     if b3_s:
                         for t in time_list:
-                            if b3_s <= t < b3_e:
-                                break_load[t] += 1
-
+                            if b3_s <= t < b3_e: break_load[t] += 1
                     item["breaks"] = []
                     if b1_s:
                         item["breaks"].append({"start": minutes_to_hhmm(b1_s % (24*60)),
@@ -791,8 +739,7 @@ def generate_roster(req: RosterRequest):
                                                "end":   minutes_to_hhmm(b3_e % (24*60)), "kind": f"break{b3_dur}"})
         except Exception as e:
             log.info(f"[break planning] skipped: {e}")
-            for item in roster:
-                item.setdefault("breaks", [])
+            for item in roster: item.setdefault("breaks", [])
 
         summary = {
             "date": req.date,
@@ -807,7 +754,6 @@ def generate_roster(req: RosterRequest):
             ],
         }
         return summary
-
     except HTTPException:
         raise
     except Exception as e:
@@ -815,7 +761,7 @@ def generate_roster(req: RosterRequest):
         raise HTTPException(500, "Internal Server Error")
 
 # ----------------------------------------------------------------------------- #
-# Generate roster for a range (+ optional persist) — updates fairness ledger
+# Generate roster for a range (+ optional persist) — ledger + prev_end
 # ----------------------------------------------------------------------------- #
 @app.post("/generate-roster-range")
 def roster_range(req: RangeRequest):
@@ -842,10 +788,8 @@ def roster_range(req: RangeRequest):
             iso = cur.strftime("%Y-%m-%d")
             rows = []
             for item in day["roster"]:
-                # Update fairness ledger by daypart (persistable)
                 dp = item.get("daypart") or "morning"
                 _ledger_add(item["agent_id"], dp, iso)
-
                 rows.append({
                     "date": iso,
                     "agent_id": item.get("agent_id"),
@@ -855,7 +799,6 @@ def roster_range(req: RangeRequest):
                     "breaks": item.get("breaks") or [],
                     "meta": item,
                 })
-                # update prev_end_times (compute end ISO)
                 try:
                     sh = item.get("shift","")
                     st_str, en_str = [s.strip() for s in sh.split("-")]
@@ -863,15 +806,12 @@ def roster_range(req: RangeRequest):
                     end_dt = datetime.strptime(iso + f"T{en_h:02d}:{en_m:02d}:00", "%Y-%m-%dT%H:%M:%S")
                     st_h, st_m = map(int, st_str.split(":"))
                     st_dt = datetime.strptime(iso + f"T{st_h:02d}:{st_m:02d}:00", "%Y-%m-%dT%H:%M:%S")
-                    if end_dt <= st_dt:
-                        end_dt = end_dt + timedelta(days=1)
+                    if end_dt <= st_dt: end_dt = end_dt + timedelta(days=1)
                     CONFIG["prev_end_times"][item["agent_id"]] = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
                 except Exception as e:
                     log.info(f"[prev_end_times update skipped] {e}")
-
             if rows:
                 sb_post("rosters", rows)
-
         cur += timedelta(days=1)
 
     if req.persist:
@@ -896,11 +836,8 @@ def save_roster(req: SaveRosterRequest):
     iso = parse_ddmmyyyy(req.date)
     rows = []
     for item in req.roster:
-        # Update fairness ledger if daypart provided in meta
-        dp = (item.get("daypart") or
-              ("night" if "22:" in str(item.get("shift","")) else "morning"))  # rough fallback
+        dp = (item.get("daypart") or "morning")
         _ledger_add(item.get("agent_id",""), dp, iso)
-
         rows.append({
             "date": iso,
             "agent_id": item.get("agent_id"),
@@ -913,7 +850,6 @@ def save_roster(req: SaveRosterRequest):
     if not rows:
         return {"status": "ok", "inserted": 0}
     sb_post("rosters", rows)
-    # persist config (ledger)
     try:
         import anyio
         anyio.from_thread.run(save_config_to_db)
@@ -922,7 +858,7 @@ def save_roster(req: SaveRosterRequest):
     return {"status": "ok", "inserted": len(rows)}
 
 # ----------------------------------------------------------------------------- #
-# Runtime config endpoints (DB-backed)
+# Runtime config endpoints
 # ----------------------------------------------------------------------------- #
 @app.get("/config")
 def get_config():
@@ -946,7 +882,6 @@ def export_config():
 
 @app.post("/admin/config/import")
 def import_config(new_conf: Dict[str, Any] = Body(...)):
-    # accept rules/fairness_ledger too
     allowed = set(CONFIG_DEFAULT.keys()) | {"rules","fairness_ledger","prev_end_times"}
     applied = {k: new_conf[k] for k in new_conf if k in allowed}
     CONFIG.update(applied)
@@ -980,7 +915,213 @@ def reset_ledger():
     return {"status":"ok","cleared_agents": n}
 
 # ----------------------------------------------------------------------------- #
-# CSV exports
+# NEW — M10: Explainability
+# ----------------------------------------------------------------------------- #
+@app.post("/explain-assignment")
+def explain_assignment(req: ExplainRequest):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+
+    # replay the same knobs used by /generate-roster (defaults)
+    r = RosterRequest(
+        date=req.date, language=req.language, grp=req.grp, service=req.service,
+        interval_seconds=CONFIG["interval_seconds"], target_sl=CONFIG["target_sl"],
+        target_t=CONFIG["target_t"], shrinkage=CONFIG["shrinkage"]
+    )
+    iso = parse_ddmmyyyy(r.date)
+    rules = CONFIG.get("rules", {})
+    dp_bounds = get_daypart_bounds(rules.get("dayparts", {}))
+    intervals = _generate_intervals(iso, r, r.interval_seconds, r.target_sl, r.target_t, r.shrinkage)
+    if not intervals:
+        return {"explain": "No forecast intervals on this date with given filters.", "eligible": False}
+
+    # candidate starts & target daypart of dominant start
+    times = sorted({hhmm_to_minutes(x["t"]) for x in intervals})
+    SHIFT_MIN = CONFIG["shift_minutes"]
+    def shift_gain(start_min):
+        demand = {t: sum(iv["req"] for iv in intervals if hhmm_to_minutes(iv["t"])==t) for t in times}
+        end_min = start_min + SHIFT_MIN
+        return sum(max(demand[t], 0) for t in times if start_min <= t < end_min)
+    candidate_starts = sorted({t for t in times}, key=lambda s: -shift_gain(s))
+    target_dp = infer_daypart(candidate_starts[0], dp_bounds or get_daypart_bounds(CONFIG["rules"]["dayparts"]))
+
+    # agent pool
+    sel = "agent_id,full_name,site_id,primary_language,secondary_language,trained_groups,trained_services"
+    agents = sb_get("agents", {"select": sel, "limit": 2000})
+    for ag in agents:
+        ag["trained_groups"] = ensure_list(ag.get("trained_groups"))
+        ag["trained_services"] = ensure_list(ag.get("trained_services"))
+
+    def eligible(ag):
+        # skills
+        if r.language and not (ag.get("primary_language")==r.language or ag.get("secondary_language")==r.language):
+            return False, "language_mismatch"
+        if r.grp and (r.grp not in ag.get("trained_groups", [])):
+            return False, "group_not_trained"
+        if r.service and (r.service not in ag.get("trained_services", []) and ag.get("trained_services")):
+            return False, "service_not_trained"
+        # site hours
+        if CONFIG["site_hours_enforced"]:
+            site = ag.get("site_id"); sh = CONFIG["site_hours"].get(site) if site else None
+            if sh and sh.get("open") and sh.get("close"):
+                o = hhmm_to_minutes(sh["open"]); c = hhmm_to_minutes(sh["close"])
+                st = candidate_starts[0]; en = st + SHIFT_MIN
+                if not (o <= st and en <= c):
+                    return False, "outside_site_hours"
+        # rest
+        prev_end = CONFIG["prev_end_times"].get(ag["agent_id"])
+        if prev_end:
+            try:
+                prev_dt = datetime.fromisoformat(prev_end)
+                today_start = datetime.strptime(iso + f"T{minutes_to_hhmm(candidate_starts[0])}:00", "%Y-%m-%dT%H:%M:%S")
+                if (today_start - prev_dt).total_seconds() < CONFIG["rest_min_minutes"] * 60:
+                    return False, "insufficient_rest"
+            except Exception:
+                pass
+        # hard: night cap
+        if target_dp == "night":
+            max_nights = int(rules.get("hard", {}).get("max_nights_per_7d", 2))
+            ct = _ledger_count_in_window(ag["agent_id"], "night", iso, 7)
+            if ct >= max_nights:
+                return False, "night_cap_reached"
+        return True, "ok"
+
+    # scoring for all
+    scored = []
+    for ag in agents:
+        ok, why = eligible(ag)
+        score, breakdown = agent_score(ag, r.language, r.grp, r.service, target_dp, iso)
+        scored.append({
+            "agent_id": ag["agent_id"], "full_name": ag["full_name"], "eligible": ok, "reason": why,
+            "score": score, "breakdown": breakdown
+        })
+    ranked = sorted([x for x in scored if x["eligible"]], key=lambda z: z["score"], reverse=True)
+
+    in_roster = None
+    if req.agent_id:
+        in_roster = next((x for x in ranked if x["agent_id"] == req.agent_id), None)
+
+    return {
+        "date": r.date,
+        "filters": {"language": r.language, "grp": r.grp, "service": r.service, "target_daypart": target_dp},
+        "buffers_hint": CONFIG.get("rules", {}).get("buffers", {}),
+        "agent": (in_roster or next((x for x in scored if x["agent_id"] == req.agent_id), None)),
+        "top_competitors": ranked[:5],
+        "notes": [
+            "Eligibility checks: language, group, service, site hours (optional), rest, night cap.",
+            "Score = skills/services weights + fairness balance adjustment (last 7 days).",
+        ]
+    }
+
+# ----------------------------------------------------------------------------- #
+# NEW — M10: Free-text config parser
+# ----------------------------------------------------------------------------- #
+def _pct(s: str) -> float:
+    return float(s) / 100.0
+
+def _hours_to_min(s: str) -> int:
+    # "9h", "9 h", "9 hour(s)"
+    m = re.search(r"(\d+)\s*h", s, flags=re.I)
+    return int(m.group(1))*60 if m else int(s)
+
+def _parse_dayparts(text: str) -> Dict[str, List[str]]:
+    # e.g. "dayparts: morning 06:00-14:00, evening 14:00-22:00, night 22:00-06:00"
+    dps = {}
+    for name, start, end in re.findall(r"(morning|evening|night)\s+(\d{1,2}:\d{2})\s*[-to]+\s*(\d{1,2}:\d{2})", text, flags=re.I):
+        dps[name.lower()] = [start, end]
+    return dps
+
+@app.post("/config/parse")
+def parse_config(req: ParseConfigRequest, apply: bool = Query(False)):
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "text is required")
+
+    proposed: Dict[str, Any] = {}
+    rules = proposed.setdefault("rules", {}); buffers = rules.setdefault("buffers", {}); hard = rules.setdefault("hard", {})
+
+    # service level
+    m = re.search(r"(service\s*level|target\s*sl)[^\d%]*?(\d{1,3})\s*%", text, flags=re.I)
+    if m: proposed["target_sl"] = round(_pct(m.group(2)), 4)
+
+    # target answer time
+    m = re.search(r"(target\s*(t|asa|answer\s*time))[^\d]*?(\d{1,4})\s*(sec|s)", text, flags=re.I)
+    if m: proposed["target_t"] = int(m.group(3))
+
+    # shrinkage
+    m = re.search(r"(shrinkage)[^\d%]*?(\d{1,3})\s*%", text, flags=re.I)
+    if m: proposed["shrinkage"] = round(_pct(m.group(2)), 4)
+
+    # shift length
+    m = re.search(r"(shift\s*(minutes|length|duration))[^\d]*?(\d{1,2})\s*(h|hour)", text, flags=re.I)
+    if m: proposed["shift_minutes"] = int(m.group(3)) * 60
+    m = re.search(r"(shift\s*(minutes|length|duration))[^\d]*?(\d{2,4})\s*min", text, flags=re.I)
+    if m: proposed["shift_minutes"] = int(m.group(3))
+
+    # breaks pattern
+    m = re.search(r"break\s*pattern[^0-9]*(\d{1,2})\D+(\d{1,2})\D+(\d{1,2})", text, flags=re.I)
+    if m: proposed["break_pattern"] = [int(m.group(1)), int(m.group(2)), int(m.group(3))]
+
+    # weekday/weekend/night buffers
+    m = re.search(r"weekday\s*buffer[^0-9%]*(\d{1,2})\s*%", text, flags=re.I)
+    if m: buffers["weekday_pct"] = round(_pct(m.group(1)), 4)
+    m = re.search(r"weekend\s*buffer[^0-9%]*(\d{1,2})\s*%", text, flags=re.I)
+    if m: buffers["weekend_pct"] = round(_pct(m.group(1)), 4)
+    m = re.search(r"(night\s*buffer|buffer\s*for\s*night)[^0-9%]*(\d{1,2})\s*%", text, flags=re.I)
+    if m: buffers["night_pct"] = round(_pct(m.group(2)), 4)
+
+    # hard rule: max nights per 7d
+    m = re.search(r"(max\s*nights?|night\s*cap)[^\d]*?(\d{1,2})\s*(per|/)\s*7", text, flags=re.I)
+    if m: hard["max_nights_per_7d"] = int(m.group(2))
+
+    # rest min hours
+    m = re.search(r"(rest|minimum\s*rest)[^\d]*?(\d{1,2})\s*(h|hour)", text, flags=re.I)
+    if m: proposed["rest_min_minutes"] = int(m.group(2)) * 60
+
+    # site hours enforced on/off
+    if re.search(r"(enforce\s*site\s*hours)\s*(on|true|enable)", text, flags=re.I):
+        proposed["site_hours_enforced"] = True
+    if re.search(r"(enforce\s*site\s*hours)\s*(off|false|disable)", text, flags=re.I):
+        proposed["site_hours_enforced"] = False
+
+    # dayparts definition
+    dps = _parse_dayparts(text)
+    if dps:
+        rules.setdefault("dayparts", {})
+        rules["dayparts"].update(dps)
+
+    # cleanup empty subdicts
+    if not buffers: rules.pop("buffers", None)
+    if not hard: rules.pop("hard", None)
+    if not rules: proposed.pop("rules", None)
+
+    if not proposed:
+        return {"applied": False, "proposed_changes": {}, "message": "No recognized settings in text."}
+
+    if apply:
+        # merge into CONFIG (shallow for top-level; deep for rules)
+        for k, v in proposed.items():
+            if k == "rules":
+                cur = CONFIG.setdefault("rules", {})
+                for rk, rv in v.items():
+                    if isinstance(rv, dict):
+                        cur.setdefault(rk, {})
+                        cur[rk].update(rv)
+                    else:
+                        cur[rk] = rv
+            else:
+                CONFIG[k] = v
+        try:
+            import anyio
+            anyio.from_thread.run(save_config_to_db)
+        except Exception:
+            pass
+        return {"applied": True, "proposed_changes": proposed}
+
+    return {"applied": False, "proposed_changes": proposed}
+
+# ----------------------------------------------------------------------------- #
+# CSV exports (unchanged except requirements new column already included)
 # ----------------------------------------------------------------------------- #
 @app.get("/export/requirements.csv", response_class=PlainTextResponse)
 def export_requirements_csv(
@@ -1022,7 +1163,7 @@ def export_roster_csv(
     return "\n".join(lines) + "\n"
 
 # ----------------------------------------------------------------------------- #
-# Playground — dd-mm-yyyy
+# Playground — dd-mm-yyyy (unchanged UI fields)
 # ----------------------------------------------------------------------------- #
 @app.get("/playground", response_class=HTMLResponse)
 def playground():
