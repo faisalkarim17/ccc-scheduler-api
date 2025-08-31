@@ -9,6 +9,8 @@ from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from math import factorial, exp, ceil
 import os, httpx, json, logging, re
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 
 # --- RBAC helpers -------------------------------------------------------------
 from functools import wraps
