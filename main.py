@@ -1382,6 +1382,97 @@ def export_roster_csv(
     return "\n".join(lines) + "\n"
 
 # ----------------------------------------------------------------------------- #
+# XLSX exports (Excel)
+# ----------------------------------------------------------------------------- #
+def _xlsx_response(wb, filename: str):
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/export/requirements.xlsx")
+def export_requirements_xlsx(
+    date: str = Query(..., description="dd-mm-yyyy"),
+    language: Optional[str] = None,
+    grp: Optional[str] = None,
+    service: Optional[str] = None,
+):
+    from openpyxl import Workbook
+    rows = requirements(date=date, language=language, grp=grp, service=service)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Requirements"
+    header = ["date","interval_time","language","grp","service","volume","aht_sec",
+              "req_core","req_after_shrinkage","req_with_buffers"]
+    ws.append(header)
+    for r in rows:
+        ws.append([r.get(k) for k in header])
+    return _xlsx_response(wb, f"requirements_{date}.xlsx")
+
+@app.get("/export/roster.xlsx")
+def export_roster_xlsx(
+    date: str = Query(..., description="dd-mm-yyyy"),
+    language: Optional[str] = None,
+    grp: Optional[str] = None,
+    service: Optional[str] = None,
+):
+    from openpyxl import Workbook
+    day = generate_roster(RosterRequest(date=date, language=language, grp=grp, service=service))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Roster"
+    header = ["date","agent_id","full_name","site_id","shift","service","breaks"]
+    ws.append(header)
+    for r in day.get("roster", []):
+        ws.append([
+            date,
+            r.get("agent_id",""),
+            r.get("full_name",""),
+            r.get("site_id",""),
+            r.get("shift",""),
+            r.get("service",""),
+            json.dumps(r.get("breaks") or [])
+        ])
+    return _xlsx_response(wb, f"roster_{date}.xlsx")
+
+# ----------------------------------------------------------------------------- #
+# Quick roll-up: total required (with buffers) by date and daypart
+# ----------------------------------------------------------------------------- #
+@app.get("/reports/requirements/summary")
+def requirements_summary(
+    date_from: str = Query(..., description="dd-mm-yyyy"),
+    date_to: str = Query(..., description="dd-mm-yyyy"),
+    language: Optional[str] = None,
+    grp: Optional[str] = None,
+    service: Optional[str] = None,
+):
+    iso_from = parse_ddmmyyyy(date_from)
+    iso_to = parse_ddmmyyyy(date_to)
+    cur = datetime.strptime(iso_from, "%Y-%m-%d")
+    end = datetime.strptime(iso_to, "%Y-%m-%d")
+    rules = CONFIG.get("rules", {})
+    dp_bounds = get_daypart_bounds(rules.get("dayparts", {}))
+    out = []
+    while cur <= end:
+        date_dd = to_ddmmyyyy(cur.strftime("%Y-%m-%d"))
+        reqs = requirements(date=date_dd, language=language, grp=grp, service=service)
+        # bucket by inferred daypart from interval_time
+        buckets = {"morning": 0, "evening": 0, "night": 0}
+        for r in reqs:
+            iv = str(r["interval_time"])
+            mins = hhmm_to_minutes(iv)
+            dp = infer_daypart(mins, dp_bounds)
+            buckets[dp] = buckets.get(dp, 0) + int(r["req_with_buffers"])
+        out.append({"date": date_dd, **buckets, "total": sum(buckets.values())})
+        cur += timedelta(days=1)
+    return out
+
+
+# ----------------------------------------------------------------------------- #
 # Playground — dd-mm-yyyy (unchanged UI fields)
 # ----------------------------------------------------------------------------- #
 @app.get("/playground", response_class=HTMLResponse)
