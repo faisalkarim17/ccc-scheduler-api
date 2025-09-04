@@ -206,8 +206,14 @@ CONFIG_DEFAULT: Dict[str, Any] = {
             "night":   ["22:00", "06:00"]
         },
         "hard": {
-            "max_nights_per_7d": 2
+            "max_nights_per_7d": 2,
+            # New (only enforced if not None):
+            "swap_min_rest_minutes": 12 * 60,   # fallbacks to rest_min_minutes if None
+            "swap_max_days_per_7d": None,       # e.g. 6
+            "swap_min_hours_per_7d": None,      # e.g. 36
+            "swap_max_hours_per_7d": None       # e.g. 60
         },
+
         "soft": {
             "balance_dayparts": True,
             "weight_balance": 1.0
@@ -507,6 +513,12 @@ class SwapRequestIn(BaseModel):
 class SwapDecisionIn(BaseModel):
     id: str                  # UUID of swap request
     approver: Optional[str] = None
+    notes: Optional[str] = None
+    
+class SwapRespondIn(BaseModel):
+    id: str
+    actor_agent_id: str          # the agent who is responding (should be agent_to)
+    decision: str                # "accept" or "decline"
     notes: Optional[str] = None
 
 # ----------------------------------------------------------------------------- #
@@ -1603,6 +1615,15 @@ def suggest_swaps(body: SwapSuggestIn):
     dp_bounds = get_daypart_bounds(CONFIG.get("rules", {}).get("dayparts", {}))
     me_dp = infer_daypart(me_start, dp_bounds) if dp_bounds else "morning"
 
+def _shift_minutes(shift_str: str) -> Tuple[int, int]:
+    """'HH:MM - HH:MM' -> (start_min, end_min) with end possibly < start if crosses midnight."""
+    st_str, en_str = [s.strip() for s in shift_str.split("-")]
+    st_h, st_m = map(int, st_str.split(":"))
+    en_h, en_m = map(int, en_str.split(":"))
+    st = st_h * 60 + st_m
+    en = en_h * 60 + en_m
+    return st, en
+
     # fetch all rostered that day
     all_rows = sb_get("rosters", {
         "select": "date,agent_id,full_name,site_id,shift,breaks,meta",
@@ -1861,29 +1882,64 @@ def swap_request(body: SwapRequestIn):
 
     ag_from = _load_agent(body.agent_from) or {}
     ag_to   = _load_agent(body.agent_to) or {}
-    ok_to, why_to = _check_capability_for_swap(ag_to, r_from.get("meta") or {})
+    ok_to, why_to     = _check_capability_for_swap(ag_to,   r_from.get("meta") or {})
     ok_from, why_from = _check_capability_for_swap(ag_from, r_to.get("meta") or {})
     if not ok_to:
-        raise HTTPException(400, f"Agent_to cannot cover agent_from shift: {why_to}")
+        raise HTTPException(400, f"agent_to cannot cover agent_from shift: {why_to}")
     if not ok_from:
-        raise HTTPException(400, f"Agent_from cannot cover agent_to shift: {why_from}")
+        raise HTTPException(400, f"agent_from cannot cover agent_to shift: {why_from}")
 
+    # Create as PROPOSED; waits for counter-party decision
     record = {
         "date": iso,
         "agent_from": body.agent_from,
         "agent_to": body.agent_to,
-        "status": "approved" if body.force else "pending",
+        "status": "proposed",
         "reason": body.reason or "",
         "meta": {"from": r_from, "to": r_to}
     }
     sb_post("swap_requests", [record])
 
+    # Optional “force” = immediate apply (admin tools)
     applied = False
     if body.force:
         _apply_swap_to_db(iso, body.agent_from, body.agent_to)
         applied = True
 
     return {"status": "ok", "created": True, "auto_applied": applied}
+
+@app.post("/swap/respond")
+@require_role("agent", "supervisor", "admin")
+async def swap_respond(body: SwapRespondIn, request: Request):
+    if not REST_BASE:
+        raise HTTPException(500, "Supabase env vars missing")
+
+    # Load request
+    rows = sb_get("swap_requests", {"select": "*", "id": f"eq.{body.id}", "limit": 1})
+    if not rows:
+        raise HTTPException(404, "Swap request not found")
+    req = rows[0]
+    if req.get("status") != "proposed":
+        raise HTTPException(400, f"Swap is {req.get('status')}, not proposed")
+
+    # Only the counter-party (agent_to) is allowed to respond
+    if body.actor_agent_id != req.get("agent_to"):
+        raise HTTPException(403, "Only the counter-party can respond to this swap")
+
+    update = dict(req)
+    meta = dict(update.get("meta") or {})
+    meta["counterparty_notes"] = body.notes or ""
+    update["meta"] = meta
+
+    if body.decision.lower() == "accept":
+        update["status"] = "accepted"
+    elif body.decision.lower() == "decline":
+        update["status"] = "declined_by_counterparty"
+    else:
+        raise HTTPException(400, "decision must be 'accept' or 'decline'")
+
+    sb_upsert("swap_requests", [update], on_conflict="id")
+    return {"status": "ok", "id": body.id, "new_status": update["status"]}
 
 
 @app.post("/swap/approve")
@@ -1897,40 +1953,67 @@ async def swap_approve(body: SwapDecisionIn, request: Request):
     if not reqs:
         raise HTTPException(404, "Swap request not found")
     req = reqs[0]
-    if req.get("status") != "pending":
-        raise HTTPException(400, f"Swap request is {req.get('status')}, not pending")
+    if req.get("status") != "accepted":
+        raise HTTPException(400, f"Supervisor can only approve 'accepted' requests (current: {req.get('status')})")
 
-    iso = req["date"]; a_from = req["agent_from"]; a_to = req["agent_to"]
+    iso   = req["date"]; a_from = req["agent_from"]; a_to = req["agent_to"]
+
+    # Before/after snapshots
     r_from_before = _get_roster_row(iso, a_from)
     r_to_before   = _get_roster_row(iso, a_to)
     if not r_from_before or not r_to_before:
         raise HTTPException(400, "Both agents need an existing roster saved for this date.")
 
-    ag_from = _load_agent(a_from) or {}
-    ag_to   = _load_agent(a_to) or {}
-    ok_to, _ = _check_capability_for_swap(ag_to, r_from_before.get("meta") or {})
-    ok_from, _ = _check_capability_for_swap(ag_from, r_to_before.get("meta") or {})
-    if not ok_to or not ok_from:
-        raise HTTPException(400, "Capability check failed on approval.")
+    # Rule checks (rest minimum; optional weekly caps if configured)
+    hard = CONFIG.get("rules", {}).get("hard", {})
+    min_rest = int(hard.get("swap_min_rest_minutes") or CONFIG.get("rest_min_minutes", 12*60))
+
+    # New shifts after swap
+    af_st, af_en = _shift_minutes(r_from_before["shift"])
+    at_st, at_en = _shift_minutes(r_to_before["shift"])
+
+    # Compare to previous-day end marks if you persist them
+    prev_end_from = CONFIG.get("prev_end_times", {}).get(a_from)
+    prev_end_to   = CONFIG.get("prev_end_times", {}).get(a_to)
+
+    def ok_rest(prev_end_iso: Optional[str], start_min: int) -> bool:
+        if not prev_end_iso:
+            return True
+        try:
+            prev_dt = datetime.fromisoformat(prev_end_iso)
+            # start of THIS day at the swapped start minute
+            today_start = datetime.strptime(iso + f"T{minutes_to_hhmm(start_min)}:00", "%Y-%m-%dT%H:%M:%S")
+            if (today_start - prev_dt).total_seconds() < min_rest * 60:
+                return False
+        except Exception:
+            return True
+        return True
+
+    # After swap, a_from would work a_to's shift start; a_to would work a_from's start
+    if not ok_rest(prev_end_from, at_st) or not ok_rest(prev_end_to, af_st):
+        raise HTTPException(400, "Swap violates minimum rest period")
+
+    # (Optional) TODO: check weekly hours/days caps here if you later set the values in CONFIG
 
     # Apply
     _apply_swap_to_db(iso, a_from, a_to)
 
-    # For "after" snapshot we read again (latest)
+    # After snapshots
     r_from_after = _get_roster_row(iso, a_from)
     r_to_after   = _get_roster_row(iso, a_to)
 
-    # Update request
+    # Mark request approved
     update = dict(req)
     update["status"] = "approved"
     update["decision_by"] = approver
     update["decision_at"] = datetime.utcnow().isoformat()
     sb_upsert("swap_requests", [update], on_conflict="id")
 
-    # Audit log
-    _audit_swap("approved", req, r_from_before, r_to_before, r_from_after, r_to_after, approver, notes=(body.notes and {"notes": body.notes}))
-
+    # Audit
+    _audit_swap("approved", req, r_from_before, r_to_before, r_from_after, r_to_after, approver,
+                notes=(body.notes and {"notes": body.notes}))
     return {"status": "ok", "approved": True, "id": body.id}
+
 
 
 @app.post("/swap/deny")
